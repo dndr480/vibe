@@ -42,6 +42,14 @@ typedef struct {
 #define PTE_PCD 0x010ULL
 #define PTE_ADDR_MASK 0x000FFFFFFFFFF000ULL
 
+#ifndef VIBE_FAULT_TEST
+#define VIBE_FAULT_TEST 0
+#endif
+
+#define VIBE_FAULT_TEST_NONE 0
+#define VIBE_FAULT_TEST_UD2 1
+#define VIBE_FAULT_TEST_PF 2
+
 enum {
     PAGING_OK = 0,
     PAGING_ERR_LA57 = 1,
@@ -208,6 +216,19 @@ typedef struct {
     volatile UINT64 rflags;
 } interrupt_trace_t;
 
+typedef struct {
+    UINT64 vector;
+    UINT64 error_code;
+    UINT64 rip;
+    UINT64 cs;
+    UINT64 rflags;
+} fault_frame_t;
+
+typedef struct {
+    UINT64 high;
+    UINT64 low;
+} uuid128_t;
+
 static idt_entry_t idt[256];
 static UINT64 gdt[3] __attribute__((aligned(8))) = {
     0x0000000000000000ULL,
@@ -215,9 +236,20 @@ static UINT64 gdt[3] __attribute__((aligned(8))) = {
     0x00cf92000000ffffULL,
 };
 static interrupt_trace_t interrupt_trace;
+static framebuffer_t kernel_framebuffer;
+static UINT32 kernel_bg;
+static UINT32 kernel_fg;
+static UINT32 kernel_accent;
+static UINT32 kernel_warn;
+static uuid128_t current_request_uuid;
 
 extern void isr_breakpoint(void);
+extern void isr_fault_ud(void);
+extern void isr_fault_df(void);
+extern void isr_fault_gp(void);
+extern void isr_fault_pf(void);
 extern void isr_unhandled(void);
+void fault_dispatch(fault_frame_t *frame) __attribute__((noreturn));
 
 __asm__(
     ".text\n"
@@ -236,6 +268,32 @@ __asm__(
     "    movl %eax, interrupt_trace+4(%rip)\n"
     "    popq %rax\n"
     "    iretq\n"
+    ".global isr_fault_ud\n"
+    "isr_fault_ud:\n"
+    "    pushq $0\n"
+    "    pushq $6\n"
+    "    jmp isr_fault_common\n"
+    ".global isr_fault_df\n"
+    "isr_fault_df:\n"
+    "    pushq $8\n"
+    "    jmp isr_fault_common\n"
+    ".global isr_fault_gp\n"
+    "isr_fault_gp:\n"
+    "    pushq $13\n"
+    "    jmp isr_fault_common\n"
+    ".global isr_fault_pf\n"
+    "isr_fault_pf:\n"
+    "    pushq $14\n"
+    "    jmp isr_fault_common\n"
+    "isr_fault_common:\n"
+    "    cld\n"
+    "    movq %rsp, %rdi\n"
+    "    andq $-16, %rsp\n"
+    "    call fault_dispatch\n"
+    "2:\n"
+    "    cli\n"
+    "    hlt\n"
+    "    jmp 2b\n"
     ".global isr_unhandled\n"
     "isr_unhandled:\n"
     "    cli\n"
@@ -505,6 +563,12 @@ static UINT64 read_cr3(void) {
 static UINT64 read_cr4(void) {
     UINT64 value;
     __asm__ __volatile__("mov %%cr4, %0" : "=r"(value));
+    return value;
+}
+
+static UINT64 read_cr2(void) {
+    UINT64 value;
+    __asm__ __volatile__("mov %%cr2, %0" : "=r"(value));
     return value;
 }
 
@@ -786,6 +850,74 @@ static const char *paging_error_name(UINT32 error) {
     }
 }
 
+static const char *fault_vector_name(UINT64 vector) {
+    switch (vector) {
+    case 6: return "INVALID OPCODE";
+    case 8: return "DOUBLE FAULT";
+    case 13: return "GENERAL PROTECTION";
+    case 14: return "PAGE FAULT";
+    default: return "UNKNOWN";
+    }
+}
+
+static char *append_uuid128(char *p, uuid128_t uuid) {
+    p = append_hex64(p, uuid.high);
+    *p++ = '-';
+    *p = 0;
+    return append_hex64(p, uuid.low);
+}
+
+void fault_dispatch(fault_frame_t *frame) {
+    framebuffer_t *fb = &kernel_framebuffer;
+    char line[192];
+    char *p;
+    UINT32 y = 48;
+
+    __asm__ __volatile__("cli" : : : "memory");
+
+    if (!fb->base || fb->width == 0 || fb->height == 0) {
+        for (;;) {
+            __asm__ __volatile__("hlt");
+        }
+    }
+
+    clear_screen(fb, kernel_bg);
+    draw_text(fb, 48, y, "BSP FAULT", kernel_warn, kernel_bg, 4);
+    y += 64;
+
+    p = append_str(line, "VECTOR: ");
+    p = append_dec64(p, frame->vector);
+    p = append_str(p, "  ");
+    p = append_str(p, fault_vector_name(frame->vector));
+    p = append_str(p, "  ERROR: ");
+    append_hex64(p, frame->error_code);
+    draw_line(fb, 48, &y, line, kernel_fg, kernel_bg, 2);
+
+    p = append_str(line, "RIP: ");
+    p = append_hex64(p, frame->rip);
+    p = append_str(p, "  CS: ");
+    p = append_hex64(p, frame->cs);
+    p = append_str(p, "  RFLAGS: ");
+    append_hex64(p, frame->rflags);
+    draw_line(fb, 48, &y, line, kernel_fg, kernel_bg, 2);
+
+    p = append_str(line, "CR2: ");
+    p = append_hex64(p, read_cr2());
+    p = append_str(p, "  CR3: ");
+    append_hex64(p, read_cr3());
+    draw_line(fb, 48, &y, line, kernel_fg, kernel_bg, 2);
+
+    p = append_str(line, "CURRENT REQUEST: ");
+    append_uuid128(p, current_request_uuid);
+    draw_line(fb, 48, &y, line, kernel_accent, kernel_bg, 2);
+
+    draw_line(fb, 48, &y, "HALTED", kernel_warn, kernel_bg, 2);
+
+    for (;;) {
+        __asm__ __volatile__("hlt");
+    }
+}
+
 static UINT16 read_cs(void) {
     UINT16 cs;
     __asm__ __volatile__("mov %%cs, %0" : "=r"(cs));
@@ -826,6 +958,30 @@ static UINT64 isr_unhandled_addr(void) {
     return addr;
 }
 
+static UINT64 isr_fault_ud_addr(void) {
+    UINT64 addr;
+    __asm__ __volatile__("leaq isr_fault_ud(%%rip), %0" : "=r"(addr));
+    return addr;
+}
+
+static UINT64 isr_fault_df_addr(void) {
+    UINT64 addr;
+    __asm__ __volatile__("leaq isr_fault_df(%%rip), %0" : "=r"(addr));
+    return addr;
+}
+
+static UINT64 isr_fault_gp_addr(void) {
+    UINT64 addr;
+    __asm__ __volatile__("leaq isr_fault_gp(%%rip), %0" : "=r"(addr));
+    return addr;
+}
+
+static UINT64 isr_fault_pf_addr(void) {
+    UINT64 addr;
+    __asm__ __volatile__("leaq isr_fault_pf(%%rip), %0" : "=r"(addr));
+    return addr;
+}
+
 static void set_idt_gate(UINT32 vector, UINT64 addr, UINT16 selector, UINT8 type_attr) {
     idt[vector].offset_low = (UINT16)(addr & 0xffff);
     idt[vector].selector = selector;
@@ -844,6 +1000,10 @@ static void install_idt(void) {
         set_idt_gate(vector, unhandled_addr, cs, 0x8e);
     }
     set_idt_gate(3, isr_breakpoint_addr(), cs, 0xef);
+    set_idt_gate(6, isr_fault_ud_addr(), cs, 0x8e);
+    set_idt_gate(8, isr_fault_df_addr(), cs, 0x8e);
+    set_idt_gate(13, isr_fault_gp_addr(), cs, 0x8e);
+    set_idt_gate(14, isr_fault_pf_addr(), cs, 0x8e);
 
     descriptor_table_ptr_t idtr;
     idtr.limit = (UINT16)(sizeof(idt) - 1);
@@ -862,6 +1022,16 @@ static int run_idt_self_test(void) {
     __asm__ __volatile__("int3" : : : "memory");
 
     return interrupt_trace.vector == 3 && interrupt_trace.count == 1;
+}
+
+static void run_fault_test_if_enabled(void) {
+#if VIBE_FAULT_TEST == VIBE_FAULT_TEST_UD2
+    __asm__ __volatile__("ud2" : : : "memory");
+#elif VIBE_FAULT_TEST == VIBE_FAULT_TEST_PF
+    volatile UINT64 *unmapped = (volatile UINT64 *)(UINTN)(LOW_CANONICAL_LIMIT - PAGE_SIZE_4K);
+    volatile UINT64 value = *unmapped;
+    (void)value;
+#endif
 }
 
 static int draw_map_line(framebuffer_t *fb, UINT32 *y, const char *s, UINT32 fg, UINT32 bg) {
@@ -1237,6 +1407,14 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE image, EFI_SYSTEM_TABLE *st) {
     UINT32 muted = color(&fb, 0xa8, 0xb0, 0xb8);
     UINT32 warn = color(&fb, 0xff, 0xc8, 0x5c);
 
+    kernel_framebuffer = fb;
+    kernel_bg = bg;
+    kernel_fg = fg;
+    kernel_accent = accent;
+    kernel_warn = warn;
+    current_request_uuid.high = 0;
+    current_request_uuid.low = 0;
+
     install_gdt();
     install_idt();
 
@@ -1249,6 +1427,7 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE image, EFI_SYSTEM_TABLE *st) {
     paging.idt_self_test_ok = run_idt_self_test() ? 1U : 0U;
     clear_screen(&fb, bg);
     draw_memory_map(&fb, &memory_map, &paging, fg, muted, accent, warn, bg);
+    run_fault_test_if_enabled();
 
     halt_forever();
     return EFI_SUCCESS;
