@@ -1,0 +1,281 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+pxe_dir="$script_dir/pxe"
+run_dir="$pxe_dir/run"
+tftp_dir="$pxe_dir/tftp"
+www_dir="$pxe_dir/www"
+system_tftp_dir="/srv/tftpboot/pxenode1"
+system_dnsmasq_dir="/run/dnsmasq"
+system_dnsmasq_conf="$system_dnsmasq_dir/pxenode1.conf"
+system_dnsmasq_pid="/run/pxenode1-dnsmasq.pid"
+system_dnsmasq_log="/var/log/dnsmasq-pxenode1.log"
+
+target_ip="${PXENODE1_TARGET_IP:-192.168.1.218}"
+http_port="${PXENODE1_PXE_HTTP_PORT:-8080}"
+iface="${PXENODE1_PXE_INTERFACE:-}"
+server_ip="${PXENODE1_PXE_SERVER_IP:-}"
+authorized_key_file="${PXENODE1_SSH_AUTHORIZED_KEY_FILE:-$HOME/.ssh/id_ed25519.pub}"
+profile="${PXENODE1_PXE_PROFILE:-ssh}"
+
+case "${1:-}" in
+  --hello)
+    profile="hello"
+    shift
+    ;;
+  --ssh)
+    profile="ssh"
+    shift
+    ;;
+  --profile)
+    profile="${2:-}"
+    shift 2
+    ;;
+esac
+
+case "$profile" in
+  ssh|hello) ;;
+  *)
+    printf 'error: unsupported PXE profile: %s\n' "$profile" >&2
+    exit 1
+    ;;
+esac
+
+mkdir -p "$run_dir" "$tftp_dir" "$www_dir/alpine"
+sudo mkdir -p "$system_tftp_dir" "$system_dnsmasq_dir"
+
+if [[ -z "$iface" ]]; then
+  iface="$(ip route get "$target_ip" | awk '{for (i=1; i<=NF; i++) if ($i == "dev") {print $(i+1); exit}}')"
+fi
+if [[ -z "$server_ip" ]]; then
+  server_ip="$(ip -4 -o addr show dev "$iface" scope global | awk '{split($4,a,"/"); print a[1]; exit}')"
+fi
+if [[ -z "$iface" || -z "$server_ip" ]]; then
+  printf 'error: could not determine PXE interface/server IP\n' >&2
+  exit 1
+fi
+
+if ! command -v python3 >/dev/null; then
+  printf 'error: python3 not found\n' >&2
+  exit 1
+fi
+if [[ ! -x /usr/sbin/dnsmasq ]]; then
+  printf 'error: /usr/sbin/dnsmasq not found\n' >&2
+  exit 1
+fi
+
+required_assets=(
+  "$tftp_dir/undionly.kpxe"
+  "$tftp_dir/snponly.efi"
+  "$www_dir/alpine/vmlinuz-virt"
+  "$www_dir/alpine/initramfs-virt"
+  "$www_dir/alpine/modloop-virt"
+)
+missing=0
+for asset in "${required_assets[@]}"; do
+  if [[ ! -s "$asset" ]]; then
+    missing=1
+    break
+  fi
+done
+if [[ "$missing" -eq 1 ]]; then
+  "$script_dir/prepare-pxe-assets"
+fi
+
+if ss -ltn "( sport = :$http_port )" | grep -q LISTEN; then
+  printf 'error: TCP port %s is already in use\n' "$http_port" >&2
+  exit 1
+fi
+
+make_boot_ipxe() {
+  case "$profile" in
+    ssh)
+      cat > "$www_dir/boot.ipxe" <<EOF
+#!ipxe
+echo pxenode1 PXE boot via ${server_ip}:${http_port}
+dhcp || goto failed
+set base http://${server_ip}:${http_port}
+kernel \${base}/alpine/vmlinuz-virt initrd=initramfs-virt modules=loop,squashfs,sd-mod,usb-storage ip=dhcp alpine_repo=https://dl-cdn.alpinelinux.org/alpine/latest-stable/main modloop=\${base}/alpine/modloop-virt apkovl=\${base}/pxenode1.apkovl.tar.gz console=tty0 console=ttyS0,115200
+initrd \${base}/alpine/initramfs-virt
+boot || goto failed
+:failed
+echo PXE boot failed
+shell
+EOF
+      ;;
+    hello)
+      cat > "$www_dir/boot.ipxe" <<EOF
+#!ipxe
+echo pxenode1 PXE hello via ${server_ip}:${http_port}
+dhcp || goto failed
+set base http://${server_ip}:${http_port}
+chain \${base}/hello.efi || goto failed
+:failed
+echo PXE hello failed
+shell
+EOF
+      ;;
+  esac
+}
+
+make_apkovl() {
+  local tmpdir
+  local authorized_key
+  if [[ ! -s "$authorized_key_file" ]]; then
+    printf 'error: SSH authorized key file not found: %s\n' "$authorized_key_file" >&2
+    exit 1
+  fi
+  authorized_key="$(<"$authorized_key_file")"
+
+  tmpdir="$(mktemp -d)"
+  mkdir -p \
+    "$tmpdir/etc/apk" \
+    "$tmpdir/etc/local.d" \
+    "$tmpdir/etc/runlevels/default" \
+    "$tmpdir/etc/ssh/sshd_config.d" \
+    "$tmpdir/root/.ssh"
+  printf 'pxenode1-pxe\n' > "$tmpdir/etc/hostname"
+  printf 'openssh\n' > "$tmpdir/etc/apk/world"
+  printf '%s\n' "$authorized_key" > "$tmpdir/root/.ssh/authorized_keys"
+  chmod 700 "$tmpdir/root" "$tmpdir/root/.ssh"
+  chmod 600 "$tmpdir/root/.ssh/authorized_keys"
+  ln -s /etc/init.d/local "$tmpdir/etc/runlevels/default/local"
+  ln -s /etc/init.d/sshd "$tmpdir/etc/runlevels/default/sshd"
+  cat > "$tmpdir/etc/ssh/sshd_config" <<'EOF'
+Port 22
+PermitRootLogin prohibit-password
+PasswordAuthentication no
+KbdInteractiveAuthentication no
+PubkeyAuthentication yes
+UseDNS no
+Subsystem sftp internal-sftp
+EOF
+  cat > "$tmpdir/etc/ssh/sshd_config.d/pxenode1.conf" <<'EOF'
+PermitRootLogin prohibit-password
+PasswordAuthentication no
+KbdInteractiveAuthentication no
+PubkeyAuthentication yes
+UseDNS no
+EOF
+cat > "$tmpdir/etc/local.d/pxenode1-booted.start" <<EOF
+#!/bin/sh
+hostname pxenode1-pxe
+printf 'pxenode1-pxe\n' > /etc/hostname
+mkdir -p /root/.ssh /etc/ssh/sshd_config.d
+chmod 700 /root /root/.ssh
+chmod 600 /root/.ssh/authorized_keys
+cat > /etc/ssh/sshd_config <<'SSHD_EOF'
+Port 22
+PermitRootLogin prohibit-password
+PasswordAuthentication no
+KbdInteractiveAuthentication no
+PubkeyAuthentication yes
+UseDNS no
+Subsystem sftp internal-sftp
+SSHD_EOF
+cat > /etc/ssh/sshd_config.d/pxenode1.conf <<'SSHD_EOF'
+PermitRootLogin prohibit-password
+PasswordAuthentication no
+KbdInteractiveAuthentication no
+PubkeyAuthentication yes
+UseDNS no
+SSHD_EOF
+ssh-keygen -A >/dev/null 2>&1 || true
+rc-service sshd restart >/dev/null 2>&1 || rc-service sshd start >/dev/null 2>&1 || /usr/sbin/sshd >/dev/null 2>&1 || true
+for i in \$(seq 1 30); do
+  wget -q -O - "http://${server_ip}:${http_port}/booted?host=pxenode1&attempt=\${i}&kernel=\$(uname -r)&ssh=started" >/dev/null 2>&1 && exit 0
+  sleep 2
+done
+exit 0
+EOF
+  chmod +x "$tmpdir/etc/local.d/pxenode1-booted.start"
+  tar -C "$tmpdir" --owner=0 --group=0 --numeric-owner -czf "$www_dir/pxenode1.apkovl.tar.gz" .
+  rm -rf "$tmpdir"
+}
+
+make_dnsmasq_conf() {
+  cat > "$run_dir/dnsmasq.conf" <<EOF
+port=0
+interface=${iface}
+bind-interfaces
+log-dhcp
+dhcp-range=192.168.1.0,proxy,255.255.255.0
+dhcp-match=set:ipxe,175
+dhcp-match=set:bios,option:client-arch,0
+dhcp-match=set:efi64,option:client-arch,7
+dhcp-match=set:efi64,option:client-arch,9
+dhcp-boot=tag:!ipxe,tag:efi64,snponly.efi
+dhcp-boot=tag:!ipxe,tag:bios,undionly.kpxe
+dhcp-boot=tag:ipxe,http://${server_ip}:${http_port}/boot.ipxe
+pxe-service=tag:!ipxe,tag:efi64,X86-64_EFI,"pxenode1 iPXE UEFI",snponly.efi
+pxe-service=tag:!ipxe,tag:bios,X86PC,"pxenode1 iPXE BIOS",undionly.kpxe
+enable-tftp
+tftp-root=${system_tftp_dir}
+EOF
+}
+
+if [[ "$profile" == "hello" ]]; then
+  "$script_dir/build-hello-efi"
+else
+  make_apkovl
+fi
+
+make_boot_ipxe
+sudo install -m 0644 "$tftp_dir/undionly.kpxe" "$system_tftp_dir/undionly.kpxe"
+sudo install -m 0644 "$tftp_dir/snponly.efi" "$system_tftp_dir/snponly.efi"
+sudo install -m 0644 "$tftp_dir/ipxe.efi" "$system_tftp_dir/ipxe.efi"
+make_dnsmasq_conf
+sudo install -m 0644 "$run_dir/dnsmasq.conf" "$system_dnsmasq_conf"
+
+sudo /usr/sbin/dnsmasq --test --conf-file="$system_dnsmasq_conf"
+
+setsid python3 "$script_dir/pxe_http_server.py" \
+  --host 0.0.0.0 \
+  --port "$http_port" \
+  --root "$www_dir" \
+  --log "$run_dir/http-requests.log" \
+  > "$run_dir/http-server.log" 2>&1 < /dev/null &
+http_pid="$!"
+printf '%s\n' "$http_pid" > "$run_dir/http.pid"
+
+http_ready=0
+for _ in $(seq 1 30); do
+  if curl --fail --silent --max-time 1 "http://127.0.0.1:${http_port}/boot.ipxe" >/dev/null; then
+    http_ready=1
+    break
+  fi
+  sleep 0.2
+done
+if [[ "$http_ready" -ne 1 ]]; then
+  kill "$http_pid" 2>/dev/null || true
+  printf 'error: HTTP server did not become ready; see %s\n' "$run_dir/http-server.log" >&2
+  exit 1
+fi
+
+sudo /usr/sbin/dnsmasq \
+  --conf-file="$system_dnsmasq_conf" \
+  --pid-file="$system_dnsmasq_pid" \
+  --log-facility="$system_dnsmasq_log"
+
+sudo cat "$system_dnsmasq_pid" > "$run_dir/dnsmasq.pid"
+
+cat > "$run_dir/server.env" <<EOF
+interface=${iface}
+server_ip=${server_ip}
+http_port=${http_port}
+target_ip=${target_ip}
+profile=${profile}
+system_tftp_dir=${system_tftp_dir}
+system_dnsmasq_conf=${system_dnsmasq_conf}
+system_dnsmasq_pid=${system_dnsmasq_pid}
+system_dnsmasq_log=${system_dnsmasq_log}
+EOF
+
+printf 'PXE server started\n'
+printf '  profile:   %s\n' "$profile"
+printf '  interface: %s\n' "$iface"
+printf '  server IP: %s\n' "$server_ip"
+printf '  HTTP:      http://%s:%s/boot.ipxe\n' "$server_ip" "$http_port"
+printf '  dnsmasq:   %s\n' "$system_dnsmasq_log"
+printf '  HTTP log:  %s\n' "$run_dir/http-requests.log"

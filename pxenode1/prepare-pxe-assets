@@ -1,0 +1,48 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+pxe_dir="$script_dir/pxe"
+tftp_dir="$pxe_dir/tftp"
+alpine_dir="$pxe_dir/www/alpine"
+
+force=0
+if [[ "${1:-}" == "--force" ]]; then
+  force=1
+fi
+
+mkdir -p "$tftp_dir" "$alpine_dir"
+
+download() {
+  local url="$1"
+  local dest="$2"
+  if [[ "$force" -eq 0 && -s "$dest" ]]; then
+    printf 'exists: %s\n' "$dest"
+    return
+  fi
+
+  local tmp
+  tmp="${dest}.tmp"
+  printf 'download: %s -> %s\n' "$url" "$dest"
+  curl --fail --location --retry 3 --retry-delay 2 --output "$tmp" "$url"
+  mv "$tmp" "$dest"
+}
+
+ipxe_base="${IPXE_BASE_URL:-https://boot.ipxe.org}"
+alpine_base="${ALPINE_NETBOOT_URL:-https://dl-cdn.alpinelinux.org/alpine/latest-stable/releases/x86_64/netboot}"
+
+download "$ipxe_base/undionly.kpxe" "$tftp_dir/undionly.kpxe"
+download "$ipxe_base/x86_64-efi/snponly.efi" "$tftp_dir/snponly.efi"
+download "$ipxe_base/x86_64-efi/ipxe.efi" "$tftp_dir/ipxe.efi"
+
+download "$alpine_base/vmlinuz-virt" "$alpine_dir/vmlinuz-virt"
+download "$alpine_base/initramfs-virt" "$alpine_dir/initramfs-virt"
+download "$alpine_base/modloop-virt" "$alpine_dir/modloop-virt"
+
+{
+  printf 'ipxe_base=%s\n' "$ipxe_base"
+  printf 'alpine_base=%s\n' "$alpine_base"
+  printf 'prepared_at=%s\n' "$(date -Is)"
+} > "$pxe_dir/assets.env"
+
+printf 'PXE assets are ready under %s\n' "$pxe_dir"

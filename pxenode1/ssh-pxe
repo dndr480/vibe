@@ -1,0 +1,15 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+host="${PXENODE1_PXE_SSH_HOST:-192.168.1.218}"
+key="${PXENODE1_PXE_SSH_KEY:-$HOME/.ssh/id_ed25519}"
+known_hosts="${PXENODE1_PXE_KNOWN_HOSTS:-/tmp/pxenode1-pxe-known-hosts}"
+
+exec ssh \
+  -i "$key" \
+  -o BatchMode=yes \
+  -o ConnectTimeout=8 \
+  -o StrictHostKeyChecking=no \
+  -o UserKnownHostsFile="$known_hosts" \
+  root@"$host" \
+  "$@"

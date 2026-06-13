@@ -1,0 +1,40 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+run_dir="$script_dir/pxe/run"
+system_dnsmasq_pid="/run/pxenode1-dnsmasq.pid"
+
+stop_pid() {
+  local pid_file="$1"
+  local use_sudo="${2:-0}"
+  if [[ ! -s "$pid_file" ]]; then
+    return
+  fi
+
+  local pid
+  pid="$(cat "$pid_file")"
+  if [[ -z "$pid" ]]; then
+    rm -f "$pid_file"
+    return
+  fi
+
+  if [[ "$use_sudo" -eq 1 ]]; then
+    if ! sudo kill -0 "$pid" 2>/dev/null; then
+      rm -f "$pid_file"
+      return
+    fi
+    sudo kill "$pid"
+    printf 'stopped pid %s from %s\n' "$pid" "$pid_file"
+  elif kill -0 "$pid" 2>/dev/null; then
+    kill "$pid"
+    printf 'stopped pid %s from %s\n' "$pid" "$pid_file"
+  fi
+  rm -f "$pid_file"
+}
+
+stop_pid "$run_dir/http.pid" 0
+stop_pid "$run_dir/dnsmasq.pid" 1
+sudo rm -f "$system_dnsmasq_pid"
+
+printf 'PXE server stopped\n'
