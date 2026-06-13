@@ -111,6 +111,14 @@ enum {
     AP_BOOT_STATE_SENT_INIT = 2,
     AP_BOOT_STATE_SENT_SIPI = 3,
     AP_BOOT_STATE_ONLINE = 4,
+    AP_BOOT_STATE_HALTED = 5,
+};
+
+enum {
+    AP_ENTRY_STATE_NONE = 0,
+    AP_ENTRY_STATE_C = 1,
+    AP_ENTRY_STATE_TABLES = 2,
+    AP_ENTRY_STATE_HALTED = 3,
 };
 
 static UINT32 color(framebuffer_t *fb, UINT8 r, UINT8 g, UINT8 b) {
@@ -340,6 +348,14 @@ typedef struct {
     UINT64 stack_top;
     volatile UINT32 online;
     volatile UINT32 ap_state;
+    volatile UINT32 entry_state;
+    volatile UINT32 gdt_ok;
+    volatile UINT32 tss_ok;
+    volatile UINT32 idt_ok;
+    volatile UINT64 ap_cs;
+    volatile UINT64 ap_tr;
+    volatile UINT64 ap_ist1;
+    volatile UINT64 ap_ist2;
     UINT32 target_acpi_uid;
     UINT32 target_apic_id;
     UINT32 sipi_vector;
@@ -371,6 +387,7 @@ typedef struct {
 
 static idt_entry_t idt[256];
 static cpu_local_t cpu0;
+static cpu_local_t cpu1;
 static cpu_local_t *current_cpu = &cpu0;
 static interrupt_trace_t interrupt_trace;
 static framebuffer_t kernel_framebuffer;
@@ -1123,11 +1140,17 @@ static void init_cpu_local(cpu_local_t *cpu, UINT32 id) {
     cpu->tss_ready = 1;
 }
 
+static void load_cpu_tables(cpu_local_t *cpu);
+
 static void install_cpu_tables(cpu_local_t *cpu) {
+    current_cpu = cpu;
+    load_cpu_tables(cpu);
+}
+
+static void load_cpu_tables(cpu_local_t *cpu) {
     descriptor_table_ptr_t gdtr;
     UINT16 tss_selector = KERNEL_TSS_SELECTOR;
 
-    current_cpu = cpu;
     gdtr.limit = (UINT16)(sizeof(cpu->gdt) - 1);
     gdtr.base = (UINT64)(UINTN)cpu->gdt;
 
@@ -1149,6 +1172,10 @@ static void install_cpu_tables(cpu_local_t *cpu) {
 
     __asm__ __volatile__("ltr %0" : : "r"(tss_selector) : "memory");
     cpu->loaded_tr = read_tr();
+}
+
+static void store_gdtr(descriptor_table_ptr_t *gdtr) {
+    __asm__ __volatile__("sgdt %0" : "=m"(*gdtr) : : "memory");
 }
 
 static UINT64 isr_breakpoint_addr(void) {
@@ -1197,6 +1224,18 @@ static void set_idt_gate(UINT32 vector, UINT64 addr, UINT16 selector, UINT8 ist,
     idt[vector].zero = 0;
 }
 
+static void load_idt_table(void) {
+    descriptor_table_ptr_t idtr;
+    idtr.limit = (UINT16)(sizeof(idt) - 1);
+    idtr.base = (UINT64)(UINTN)idt;
+
+    __asm__ __volatile__("cli; lidt %0" : : "m"(idtr) : "memory");
+}
+
+static void store_idtr(descriptor_table_ptr_t *idtr) {
+    __asm__ __volatile__("sidt %0" : "=m"(*idtr) : : "memory");
+}
+
 static void install_idt(void) {
     UINT16 cs = read_cs();
     UINT64 unhandled_addr = isr_unhandled_addr();
@@ -1210,11 +1249,43 @@ static void install_idt(void) {
     set_idt_gate(13, isr_fault_gp_addr(), cs, CPU_IST_FAULT, 0x8e);
     set_idt_gate(14, isr_fault_pf_addr(), cs, CPU_IST_FAULT, 0x8e);
 
-    descriptor_table_ptr_t idtr;
-    idtr.limit = (UINT16)(sizeof(idt) - 1);
-    idtr.base = (UINT64)(UINTN)idt;
+    load_idt_table();
+}
 
-    __asm__ __volatile__("cli; lidt %0" : : "m"(idtr) : "memory");
+static void ap_entry_one(void) __attribute__((noreturn));
+static void ap_entry_one(void) {
+    descriptor_table_ptr_t gdtr;
+    descriptor_table_ptr_t idtr;
+
+    __asm__ __volatile__("cli" : : : "memory");
+    ap_boot.entry_state = AP_ENTRY_STATE_C;
+
+    init_cpu_local(&cpu1, 1);
+    load_cpu_tables(&cpu1);
+    load_idt_table();
+
+    store_gdtr(&gdtr);
+    store_idtr(&idtr);
+
+    ap_boot.ap_cs = read_cs();
+    ap_boot.ap_tr = read_tr();
+    ap_boot.ap_ist1 = cpu1.tss.ist[CPU_IST_FAULT - 1];
+    ap_boot.ap_ist2 = cpu1.tss.ist[CPU_IST_DOUBLE_FAULT - 1];
+    ap_boot.gdt_ok = (gdtr.base == (UINT64)(UINTN)cpu1.gdt &&
+                      gdtr.limit == (UINT16)(sizeof(cpu1.gdt) - 1)) ? 1U : 0U;
+    ap_boot.tss_ok = (ap_boot.ap_tr == KERNEL_TSS_SELECTOR && cpu1.tss_ready &&
+                      ap_boot.ap_ist1 != 0 && ap_boot.ap_ist2 != 0) ? 1U : 0U;
+    ap_boot.idt_ok = (idtr.base == (UINT64)(UINTN)idt &&
+                      idtr.limit == (UINT16)(sizeof(idt) - 1)) ? 1U : 0U;
+    ap_boot.entry_state = AP_ENTRY_STATE_TABLES;
+    ap_boot.ap_state = AP_BOOT_STATE_HALTED;
+    ap_boot.entry_state = AP_ENTRY_STATE_HALTED;
+    __asm__ __volatile__("mfence" : : : "memory");
+    ap_boot.online = 1;
+
+    for (;;) {
+        __asm__ __volatile__("cli; hlt" : : : "memory");
+    }
 }
 
 static int run_idt_self_test(void) {
@@ -1705,11 +1776,8 @@ static int build_ap_trampoline(ap_boot_info_t *boot, paging_info_t *paging) {
     emit8(&p, 0x8e); emit8(&p, 0xd0);        /* mov ss, eax */
     emit_mov_rax_imm64(&p, boot->stack_top);
     emit8(&p, 0x48); emit8(&p, 0x89); emit8(&p, 0xc4); /* mov rsp, rax */
-    emit_mov_rax_imm64(&p, (UINT64)(UINTN)&boot->online);
-    emit8(&p, 0xc7); emit8(&p, 0x00); emit32(&p, 1);   /* mov dword [rax], 1 */
-    emit_mov_rax_imm64(&p, (UINT64)(UINTN)&boot->ap_state);
-    emit8(&p, 0xc7); emit8(&p, 0x00); emit32(&p, AP_BOOT_STATE_ONLINE);
-    emit8(&p, 0x0f); emit8(&p, 0xae); emit8(&p, 0xf0); /* mfence */
+    emit_mov_rax_imm64(&p, (UINT64)(UINTN)ap_entry_one);
+    emit8(&p, 0xff); emit8(&p, 0xd0);        /* call rax */
     emit8(&p, 0xfa);                         /* cli */
     emit8(&p, 0xf4);                         /* hlt */
     emit8(&p, 0xeb); emit8(&p, 0xfd);        /* jmp hlt */
@@ -1781,6 +1849,14 @@ static void enable_lapic_if_needed(UINT64 base) {
 static void bring_up_one_ap(ap_boot_info_t *boot, acpi_info_t *acpi, efi_memory_map_t *map, paging_info_t *paging) {
     boot->online = 0;
     boot->ap_state = AP_BOOT_STATE_NONE;
+    boot->entry_state = AP_ENTRY_STATE_NONE;
+    boot->gdt_ok = 0;
+    boot->tss_ok = 0;
+    boot->idt_ok = 0;
+    boot->ap_cs = 0;
+    boot->ap_tr = 0;
+    boot->ap_ist1 = 0;
+    boot->ap_ist2 = 0;
     boot->wait_loops = 0;
     boot->icr_timeouts = 0;
 
@@ -1837,7 +1913,9 @@ static void bring_up_one_ap(ap_boot_info_t *boot, acpi_info_t *acpi, efi_memory_
 
     for (UINT32 i = 0; i < AP_ONLINE_TIMEOUT_LOOPS; i++) {
         if (boot->online) {
-            boot->ap_state = AP_BOOT_STATE_ONLINE;
+            if (boot->ap_state != AP_BOOT_STATE_HALTED) {
+                boot->ap_state = AP_BOOT_STATE_ONLINE;
+            }
             boot->error = AP_BOOT_OK;
             boot->wait_loops = i;
             return;
@@ -1871,6 +1949,17 @@ static const char *ap_boot_state_name(UINT32 state) {
     case AP_BOOT_STATE_SENT_INIT: return "SENT-INIT";
     case AP_BOOT_STATE_SENT_SIPI: return "SENT-SIPI";
     case AP_BOOT_STATE_ONLINE: return "ONLINE";
+    case AP_BOOT_STATE_HALTED: return "HALTED";
+    default: return "UNKNOWN";
+    }
+}
+
+static const char *ap_entry_state_name(UINT32 state) {
+    switch (state) {
+    case AP_ENTRY_STATE_NONE: return "NONE";
+    case AP_ENTRY_STATE_C: return "C";
+    case AP_ENTRY_STATE_TABLES: return "TABLES";
+    case AP_ENTRY_STATE_HALTED: return "HALTED";
     default: return "UNKNOWN";
     }
 }
@@ -1897,6 +1986,26 @@ static void draw_ap_boot_info(framebuffer_t *fb, UINT32 *y, ap_boot_info_t *boot
     p = append_dec(p, boot->sipi_vector);
     p = append_str(p, "  ICR-TO: ");
     append_dec(p, boot->icr_timeouts);
+    draw_line(fb, 48, y, line, fg, bg, 2);
+
+    p = append_str(line, "AP ENTRY: ");
+    p = append_str(p, ap_entry_state_name(boot->entry_state));
+    p = append_str(p, "  GDT: ");
+    p = append_str(p, boot->gdt_ok ? "OK" : "NO");
+    p = append_str(p, "  TSS: ");
+    p = append_str(p, boot->tss_ok ? "OK" : "NO");
+    p = append_str(p, "  IDT: ");
+    p = append_str(p, boot->idt_ok ? "OK" : "NO");
+    p = append_str(p, "  CS: ");
+    p = append_hex64(p, boot->ap_cs);
+    p = append_str(p, "  TR: ");
+    append_hex64(p, boot->ap_tr);
+    draw_line(fb, 48, y, line, (boot->gdt_ok && boot->tss_ok && boot->idt_ok) ? accent : fg, bg, 2);
+
+    p = append_str(line, "AP IST1: ");
+    p = append_hex64(p, boot->ap_ist1);
+    p = append_str(p, "  IST2: ");
+    append_hex64(p, boot->ap_ist2);
     draw_line(fb, 48, y, line, fg, bg, 2);
 }
 
