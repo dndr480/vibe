@@ -61,6 +61,15 @@ typedef struct {
 #define ACPI_MAX_RSDP_LENGTH 4096U
 #define ACPI_MAX_SDT_LENGTH (1024U * 1024U)
 #define ACPI_CPU_LIST_OUTPUT_LIMIT 5
+#define AP_BOOT_STACK_SIZE (16 * 1024)
+#define AP_TRAMPOLINE_PAGES 1ULL
+#define AP_TRAMPOLINE_MAX_ADDRESS 0x9F000ULL
+#define AP_TRAMPOLINE_PROT32_OFFSET 0x60U
+#define AP_TRAMPOLINE_LONG_OFFSET 0xC0U
+#define AP_TRAMPOLINE_GDTR_OFFSET 0x180U
+#define AP_TRAMPOLINE_GDT_OFFSET 0x190U
+#define AP_TRAMPOLINE_PROT32_SELECTOR 0x18
+#define AP_ONLINE_TIMEOUT_LOOPS 100000000U
 
 enum {
     PAGING_OK = 0,
@@ -82,6 +91,26 @@ enum {
     ACPI_ERR_BAD_MADT = 6,
     ACPI_ERR_BAD_ENTRY = 7,
     ACPI_ERR_RANGE = 8,
+};
+
+enum {
+    AP_BOOT_OK = 0,
+    AP_BOOT_ERR_NO_TRAMPOLINE = 1,
+    AP_BOOT_ERR_NO_TARGET = 2,
+    AP_BOOT_ERR_X2APIC = 3,
+    AP_BOOT_ERR_BAD_TRAMPOLINE = 4,
+    AP_BOOT_ERR_HIGH_CR3 = 5,
+    AP_BOOT_ERR_LAPIC_RANGE = 6,
+    AP_BOOT_ERR_ICR_TIMEOUT = 7,
+    AP_BOOT_ERR_ONLINE_TIMEOUT = 8,
+};
+
+enum {
+    AP_BOOT_STATE_NONE = 0,
+    AP_BOOT_STATE_READY = 1,
+    AP_BOOT_STATE_SENT_INIT = 2,
+    AP_BOOT_STATE_SENT_SIPI = 3,
+    AP_BOOT_STATE_ONLINE = 4,
 };
 
 static UINT32 color(framebuffer_t *fb, UINT8 r, UINT8 g, UINT8 b) {
@@ -307,6 +336,19 @@ typedef struct {
 } acpi_info_t;
 
 typedef struct {
+    UINT64 trampoline_base;
+    UINT64 stack_top;
+    volatile UINT32 online;
+    volatile UINT32 ap_state;
+    UINT32 target_acpi_uid;
+    UINT32 target_apic_id;
+    UINT32 sipi_vector;
+    UINT32 error;
+    UINT32 wait_loops;
+    UINT32 icr_timeouts;
+} ap_boot_info_t;
+
+typedef struct {
     volatile UINT32 vector;
     volatile UINT32 count;
     volatile UINT64 rip;
@@ -337,6 +379,8 @@ static UINT32 kernel_fg;
 static UINT32 kernel_accent;
 static UINT32 kernel_warn;
 static uuid128_t current_request_uuid;
+static ap_boot_info_t ap_boot;
+static UINT8 ap_boot_stack[AP_BOOT_STACK_SIZE] __attribute__((aligned(16)));
 
 extern void isr_breakpoint(void);
 extern void isr_fault_ud(void);
@@ -1523,6 +1567,339 @@ static void draw_acpi_info(framebuffer_t *fb, UINT32 *y, acpi_info_t *acpi, UINT
     draw_line(fb, 48, y, line, fg, bg, 2);
 }
 
+static void write_u16(UINT8 *p, UINT16 value) {
+    p[0] = (UINT8)(value & 0xff);
+    p[1] = (UINT8)((value >> 8) & 0xff);
+}
+
+static void write_u32(UINT8 *p, UINT32 value) {
+    p[0] = (UINT8)(value & 0xff);
+    p[1] = (UINT8)((value >> 8) & 0xff);
+    p[2] = (UINT8)((value >> 16) & 0xff);
+    p[3] = (UINT8)((value >> 24) & 0xff);
+}
+
+static void write_u64(UINT8 *p, UINT64 value) {
+    write_u32(p, (UINT32)(value & 0xffffffffULL));
+    write_u32(p + 4, (UINT32)(value >> 32));
+}
+
+static void emit8(UINT8 **p, UINT8 value) {
+    **p = value;
+    *p += 1;
+}
+
+static void emit16(UINT8 **p, UINT16 value) {
+    write_u16(*p, value);
+    *p += 2;
+}
+
+static void emit32(UINT8 **p, UINT32 value) {
+    write_u32(*p, value);
+    *p += 4;
+}
+
+static void emit64(UINT8 **p, UINT64 value) {
+    write_u64(*p, value);
+    *p += 8;
+}
+
+static void emit_mov_rax_imm64(UINT8 **p, UINT64 value) {
+    emit8(p, 0x48);
+    emit8(p, 0xb8);
+    emit64(p, value);
+}
+
+static EFI_STATUS allocate_ap_trampoline(EFI_BOOT_SERVICES *bs, ap_boot_info_t *boot) {
+    zero_memory(boot, sizeof(*boot));
+    EFI_PHYSICAL_ADDRESS base = AP_TRAMPOLINE_MAX_ADDRESS;
+    EFI_STATUS status = bs->AllocatePages(AllocateMaxAddress, EfiLoaderData, AP_TRAMPOLINE_PAGES, &base);
+    if (status != EFI_SUCCESS || base == 0 || base >= 0x100000ULL || (base & (PAGE_SIZE_4K - 1)) != 0) {
+        boot->error = AP_BOOT_ERR_NO_TRAMPOLINE;
+        return status == EFI_SUCCESS ? (EFI_STATUS)1 : status;
+    }
+
+    boot->trampoline_base = base;
+    boot->sipi_vector = (UINT32)(base >> 12);
+    boot->error = AP_BOOT_OK;
+    return EFI_SUCCESS;
+}
+
+static int select_ap_target(acpi_info_t *acpi, ap_boot_info_t *boot) {
+    if (acpi->error != ACPI_OK) {
+        return 0;
+    }
+
+    for (UINT32 i = 0; i < acpi->stored_cpu_count; i++) {
+        acpi_cpu_t *cpu = &acpi->cpus[i];
+        if (!cpu->x2apic && cpu->apic_id != acpi->bsp_apic_id && cpu->apic_id < 256) {
+            boot->target_acpi_uid = cpu->acpi_uid;
+            boot->target_apic_id = cpu->apic_id;
+            return 1;
+        }
+    }
+
+    return 0;
+}
+
+static int build_ap_trampoline(ap_boot_info_t *boot, paging_info_t *paging) {
+    if (boot->trampoline_base == 0 || boot->trampoline_base >= 0x100000ULL ||
+        (boot->trampoline_base & (PAGE_SIZE_4K - 1)) != 0 || boot->sipi_vector == 0 ||
+        boot->sipi_vector > 0xff) {
+        boot->error = AP_BOOT_ERR_BAD_TRAMPOLINE;
+        return 0;
+    }
+    if (paging->loaded_cr3 > 0xffffffffULL) {
+        boot->error = AP_BOOT_ERR_HIGH_CR3;
+        return 0;
+    }
+
+    UINT8 *page = (UINT8 *)(UINTN)boot->trampoline_base;
+    for (UINT32 i = 0; i < PAGE_SIZE_4K; i++) {
+        page[i] = 0;
+    }
+    boot->stack_top = (UINT64)(UINTN)(ap_boot_stack + sizeof(ap_boot_stack));
+
+    UINT8 *p = page;
+    emit8(&p, 0xfa);                         /* cli */
+    emit8(&p, 0xfc);                         /* cld */
+    emit8(&p, 0x8c); emit8(&p, 0xc8);        /* mov ax, cs */
+    emit8(&p, 0x8e); emit8(&p, 0xd8);        /* mov ds, ax */
+    emit8(&p, 0x8e); emit8(&p, 0xc0);        /* mov es, ax */
+    emit8(&p, 0x8e); emit8(&p, 0xd0);        /* mov ss, ax */
+    emit8(&p, 0xbc); emit16(&p, 0x0ff0);     /* mov sp, 0x0ff0 */
+    emit8(&p, 0x0f); emit8(&p, 0x01); emit8(&p, 0x16);
+    emit16(&p, AP_TRAMPOLINE_GDTR_OFFSET);   /* lgdt [gdtr] */
+    emit8(&p, 0x0f); emit8(&p, 0x20); emit8(&p, 0xc0); /* mov eax, cr0 */
+    emit8(&p, 0x66); emit8(&p, 0x0d); emit32(&p, 0x1); /* or eax, PE */
+    emit8(&p, 0x0f); emit8(&p, 0x22); emit8(&p, 0xc0); /* mov cr0, eax */
+    emit8(&p, 0x66); emit8(&p, 0xea);
+    emit32(&p, (UINT32)(boot->trampoline_base + AP_TRAMPOLINE_PROT32_OFFSET));
+    emit16(&p, AP_TRAMPOLINE_PROT32_SELECTOR); /* jmp far 0x18:protected32 */
+
+    p = page + AP_TRAMPOLINE_PROT32_OFFSET;
+    emit8(&p, 0x66); emit8(&p, 0xb8); emit16(&p, KERNEL_DATA_SELECTOR); /* mov ax, 0x10 */
+    emit8(&p, 0x8e); emit8(&p, 0xd8);        /* mov ds, eax */
+    emit8(&p, 0x8e); emit8(&p, 0xc0);        /* mov es, eax */
+    emit8(&p, 0x8e); emit8(&p, 0xd0);        /* mov ss, eax */
+    emit8(&p, 0x0f); emit8(&p, 0x20); emit8(&p, 0xe0); /* mov eax, cr4 */
+    emit8(&p, 0x0d); emit32(&p, 0x20);       /* or eax, PAE */
+    emit8(&p, 0x0f); emit8(&p, 0x22); emit8(&p, 0xe0); /* mov cr4, eax */
+    emit8(&p, 0xb8); emit32(&p, (UINT32)paging->loaded_cr3); /* mov eax, cr3 */
+    emit8(&p, 0x0f); emit8(&p, 0x22); emit8(&p, 0xd8); /* mov cr3, eax */
+    emit8(&p, 0xb9); emit32(&p, 0xc0000080U); /* mov ecx, EFER */
+    emit8(&p, 0x0f); emit8(&p, 0x32);        /* rdmsr */
+    emit8(&p, 0x0d); emit32(&p, 0x100);      /* or eax, LME */
+    emit8(&p, 0x0f); emit8(&p, 0x30);        /* wrmsr */
+    emit8(&p, 0x0f); emit8(&p, 0x20); emit8(&p, 0xc0); /* mov eax, cr0 */
+    emit8(&p, 0x0d); emit32(&p, 0x80000000U); /* or eax, PG */
+    emit8(&p, 0x0f); emit8(&p, 0x22); emit8(&p, 0xc0); /* mov cr0, eax */
+    emit8(&p, 0xea);
+    emit32(&p, (UINT32)(boot->trampoline_base + AP_TRAMPOLINE_LONG_OFFSET));
+    emit16(&p, KERNEL_CODE_SELECTOR);        /* jmp far 0x08:long_entry */
+
+    p = page + AP_TRAMPOLINE_LONG_OFFSET;
+    emit8(&p, 0x66); emit8(&p, 0xb8); emit16(&p, KERNEL_DATA_SELECTOR); /* mov ax, 0x10 */
+    emit8(&p, 0x8e); emit8(&p, 0xd8);        /* mov ds, eax */
+    emit8(&p, 0x8e); emit8(&p, 0xc0);        /* mov es, eax */
+    emit8(&p, 0x8e); emit8(&p, 0xd0);        /* mov ss, eax */
+    emit_mov_rax_imm64(&p, boot->stack_top);
+    emit8(&p, 0x48); emit8(&p, 0x89); emit8(&p, 0xc4); /* mov rsp, rax */
+    emit_mov_rax_imm64(&p, (UINT64)(UINTN)&boot->online);
+    emit8(&p, 0xc7); emit8(&p, 0x00); emit32(&p, 1);   /* mov dword [rax], 1 */
+    emit_mov_rax_imm64(&p, (UINT64)(UINTN)&boot->ap_state);
+    emit8(&p, 0xc7); emit8(&p, 0x00); emit32(&p, AP_BOOT_STATE_ONLINE);
+    emit8(&p, 0x0f); emit8(&p, 0xae); emit8(&p, 0xf0); /* mfence */
+    emit8(&p, 0xfa);                         /* cli */
+    emit8(&p, 0xf4);                         /* hlt */
+    emit8(&p, 0xeb); emit8(&p, 0xfd);        /* jmp hlt */
+
+    UINT8 *gdtr = page + AP_TRAMPOLINE_GDTR_OFFSET;
+    write_u16(gdtr, (UINT16)(4 * sizeof(UINT64) - 1));
+    write_u32(gdtr + 2, (UINT32)(boot->trampoline_base + AP_TRAMPOLINE_GDT_OFFSET));
+
+    UINT8 *gdt = page + AP_TRAMPOLINE_GDT_OFFSET;
+    write_u64(gdt + 0, 0x0000000000000000ULL);
+    write_u64(gdt + 8, 0x00af9a000000ffffULL);
+    write_u64(gdt + 16, 0x00cf92000000ffffULL);
+    write_u64(gdt + 24, 0x00cf9a000000ffffULL);
+
+    boot->ap_state = AP_BOOT_STATE_READY;
+    return 1;
+}
+
+static UINT64 read_msr(UINT32 msr) {
+    UINT32 low = 0;
+    UINT32 high = 0;
+    __asm__ __volatile__("rdmsr" : "=a"(low), "=d"(high) : "c"(msr));
+    return ((UINT64)high << 32) | low;
+}
+
+static void delay_loops(UINT32 loops) {
+    for (volatile UINT32 i = 0; i < loops; i++) {
+        __asm__ __volatile__("pause");
+    }
+}
+
+static UINT32 lapic_read32(UINT64 base, UINT32 reg) {
+    return *(volatile UINT32 *)(UINTN)(base + reg);
+}
+
+static void lapic_write32(UINT64 base, UINT32 reg, UINT32 value) {
+    *(volatile UINT32 *)(UINTN)(base + reg) = value;
+}
+
+static int lapic_wait_icr_idle(UINT64 base, ap_boot_info_t *boot) {
+    for (UINT32 i = 0; i < 1000000U; i++) {
+        if ((lapic_read32(base, 0x300) & (1U << 12)) == 0) {
+            return 1;
+        }
+        __asm__ __volatile__("pause");
+    }
+
+    boot->icr_timeouts++;
+    return 0;
+}
+
+static int lapic_send_ipi(UINT64 base, UINT32 apic_id, UINT32 command, ap_boot_info_t *boot) {
+    if (!lapic_wait_icr_idle(base, boot)) {
+        return 0;
+    }
+
+    lapic_write32(base, 0x310, apic_id << 24);
+    lapic_write32(base, 0x300, command);
+    return lapic_wait_icr_idle(base, boot);
+}
+
+static void enable_lapic_if_needed(UINT64 base) {
+    UINT32 svr = lapic_read32(base, 0x0f0);
+    if ((svr & (1U << 8)) == 0) {
+        lapic_write32(base, 0x0f0, (svr & 0xffffff00U) | 0x1ffU);
+    }
+}
+
+static void bring_up_one_ap(ap_boot_info_t *boot, acpi_info_t *acpi, efi_memory_map_t *map, paging_info_t *paging) {
+    boot->online = 0;
+    boot->ap_state = AP_BOOT_STATE_NONE;
+    boot->wait_loops = 0;
+    boot->icr_timeouts = 0;
+
+    if (boot->error != AP_BOOT_OK) {
+        return;
+    }
+    if (!select_ap_target(acpi, boot)) {
+        boot->error = AP_BOOT_ERR_NO_TARGET;
+        return;
+    }
+    if (read_msr(0x1b) & (1ULL << 10)) {
+        boot->error = AP_BOOT_ERR_X2APIC;
+        return;
+    }
+    if (!memory_map_contains_range(map, acpi->local_apic_base, PAGE_SIZE_4K)) {
+        boot->error = AP_BOOT_ERR_LAPIC_RANGE;
+        return;
+    }
+    if (!build_ap_trampoline(boot, paging)) {
+        return;
+    }
+    __asm__ __volatile__("mfence" : : : "memory");
+
+    UINT64 lapic_base = acpi->local_apic_base;
+    enable_lapic_if_needed(lapic_base);
+
+    if (!lapic_send_ipi(lapic_base, boot->target_apic_id, 0x00004500U, boot)) {
+        boot->error = AP_BOOT_ERR_ICR_TIMEOUT;
+        return;
+    }
+    boot->ap_state = AP_BOOT_STATE_SENT_INIT;
+    delay_loops(1000000U);
+
+    if (!lapic_send_ipi(lapic_base, boot->target_apic_id, 0x00008500U, boot)) {
+        boot->error = AP_BOOT_ERR_ICR_TIMEOUT;
+        return;
+    }
+    delay_loops(1000000U);
+
+    UINT32 sipi = 0x00000600U | (boot->sipi_vector & 0xffU);
+    if (!lapic_send_ipi(lapic_base, boot->target_apic_id, sipi, boot)) {
+        boot->error = AP_BOOT_ERR_ICR_TIMEOUT;
+        return;
+    }
+    boot->ap_state = AP_BOOT_STATE_SENT_SIPI;
+    delay_loops(200000U);
+
+    if (!boot->online) {
+        if (!lapic_send_ipi(lapic_base, boot->target_apic_id, sipi, boot)) {
+            boot->error = AP_BOOT_ERR_ICR_TIMEOUT;
+            return;
+        }
+    }
+
+    for (UINT32 i = 0; i < AP_ONLINE_TIMEOUT_LOOPS; i++) {
+        if (boot->online) {
+            boot->ap_state = AP_BOOT_STATE_ONLINE;
+            boot->error = AP_BOOT_OK;
+            boot->wait_loops = i;
+            return;
+        }
+        __asm__ __volatile__("pause");
+    }
+
+    boot->wait_loops = AP_ONLINE_TIMEOUT_LOOPS;
+    boot->error = AP_BOOT_ERR_ONLINE_TIMEOUT;
+}
+
+static const char *ap_boot_error_name(UINT32 error) {
+    switch (error) {
+    case AP_BOOT_OK: return "OK";
+    case AP_BOOT_ERR_NO_TRAMPOLINE: return "NO-TRAMP";
+    case AP_BOOT_ERR_NO_TARGET: return "NO-TARGET";
+    case AP_BOOT_ERR_X2APIC: return "X2APIC";
+    case AP_BOOT_ERR_BAD_TRAMPOLINE: return "BAD-TRAMP";
+    case AP_BOOT_ERR_HIGH_CR3: return "HIGH-CR3";
+    case AP_BOOT_ERR_LAPIC_RANGE: return "LAPIC-RANGE";
+    case AP_BOOT_ERR_ICR_TIMEOUT: return "ICR-TIMEOUT";
+    case AP_BOOT_ERR_ONLINE_TIMEOUT: return "ONLINE-TIMEOUT";
+    default: return "UNKNOWN";
+    }
+}
+
+static const char *ap_boot_state_name(UINT32 state) {
+    switch (state) {
+    case AP_BOOT_STATE_NONE: return "NONE";
+    case AP_BOOT_STATE_READY: return "READY";
+    case AP_BOOT_STATE_SENT_INIT: return "SENT-INIT";
+    case AP_BOOT_STATE_SENT_SIPI: return "SENT-SIPI";
+    case AP_BOOT_STATE_ONLINE: return "ONLINE";
+    default: return "UNKNOWN";
+    }
+}
+
+static void draw_ap_boot_info(framebuffer_t *fb, UINT32 *y, ap_boot_info_t *boot, UINT32 fg,
+                              UINT32 accent, UINT32 warn, UINT32 bg) {
+    char line[192];
+    char *p = append_str(line, "AP START: ");
+    p = append_str(p, ap_boot_error_name(boot->error));
+    p = append_str(p, "  TARGET UID/APIC: ");
+    p = append_dec(p, boot->target_acpi_uid);
+    *p++ = '/';
+    *p = 0;
+    p = append_dec(p, boot->target_apic_id);
+    p = append_str(p, "  ONLINE: ");
+    append_dec(p, boot->online ? 1U : 0U);
+    draw_line(fb, 48, y, line, boot->error == AP_BOOT_OK ? accent : warn, bg, 2);
+
+    p = append_str(line, "AP STATE: ");
+    p = append_str(p, ap_boot_state_name(boot->ap_state));
+    p = append_str(p, "  TRAMP: ");
+    p = append_hex64(p, boot->trampoline_base);
+    p = append_str(p, "  SIPI: ");
+    p = append_dec(p, boot->sipi_vector);
+    p = append_str(p, "  ICR-TO: ");
+    append_dec(p, boot->icr_timeouts);
+    draw_line(fb, 48, y, line, fg, bg, 2);
+}
+
 static int draw_map_line(framebuffer_t *fb, UINT32 *y, const char *s, UINT32 fg, UINT32 bg) {
     if (*y + 20 > fb->height) {
         return 0;
@@ -1547,8 +1924,8 @@ static UINT32 memory_line_color(EFI_MEMORY_DESCRIPTOR *desc, UINT32 fg, UINT32 m
 }
 
 static void draw_memory_map(framebuffer_t *fb, efi_memory_map_t *map, paging_info_t *paging,
-                            acpi_info_t *acpi, UINT32 fg, UINT32 muted, UINT32 accent, UINT32 warn,
-                            UINT32 bg) {
+                            acpi_info_t *acpi, ap_boot_info_t *ap, UINT32 fg, UINT32 muted,
+                            UINT32 accent, UINT32 warn, UINT32 bg) {
     UINT64 conventional_pages = 0;
     UINT64 loader_pages = 0;
     UINT64 boot_pages = 0;
@@ -1635,6 +2012,11 @@ static void draw_memory_map(framebuffer_t *fb, efi_memory_map_t *map, paging_inf
 
     if (acpi) {
         draw_acpi_info(fb, &y, acpi, fg, accent, warn, bg);
+        y += 8;
+    }
+
+    if (ap) {
+        draw_ap_boot_info(fb, &y, ap, fg, accent, warn, bg);
         y += 8;
     }
 
@@ -1881,6 +2263,7 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE image, EFI_SYSTEM_TABLE *st) {
     fb.format = gop->Mode->Info->PixelFormat;
 
     UINT64 acpi_rsdp = find_acpi_rsdp(st);
+    allocate_ap_trampoline(bs, &ap_boot);
 
     efi_memory_map_t memory_map;
     memory_map.descriptors = 0;
@@ -1925,9 +2308,10 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE image, EFI_SYSTEM_TABLE *st) {
     paging.idt_self_test_ok = run_idt_self_test() ? 1U : 0U;
     acpi_info_t acpi;
     parse_acpi(acpi_rsdp, &memory_map, &acpi);
+    bring_up_one_ap(&ap_boot, &acpi, &memory_map, &paging);
 
     clear_screen(&fb, bg);
-    draw_memory_map(&fb, &memory_map, &paging, &acpi, fg, muted, accent, warn, bg);
+    draw_memory_map(&fb, &memory_map, &paging, &acpi, &ap_boot, fg, muted, accent, warn, bg);
     run_fault_test_if_enabled();
 
     halt_forever();
