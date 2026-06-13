@@ -232,6 +232,11 @@ MODE NOW: X86-64 LONG MODE
 ARCHITECTURE: X86_64
 CPU OP-MODES: 32-BIT 64-BIT
 BYTE ORDER: LITTLE ENDIAN
+GDT: INSTALLED
+IDT: INSTALLED
+IDT SELF-TEST: BP HANDLED
+AFTER INT3: YES
+IDT VECTOR: 3  COUNT: 1
 VENDOR ID: ...
 MODEL NAME: ...
 CPU FAMILY: ...
@@ -250,7 +255,13 @@ GET /boot.ipxe
 GET /kernel/kernel.efi
 ```
 
-This profile does not boot Linux and does not start SSH. It is expected to stop in the custom kernel after drawing to the framebuffer. On x86_64 UEFI, `kernel.efi` is entered in 64-bit long mode. The current kernel calls `ExitBootServices()` and continues in that inherited long-mode environment; it does not yet install its own GDT, IDT, page tables, scheduler, or memory manager.
+This profile does not boot Linux and does not start SSH. It is expected to stop in the custom kernel after drawing to the framebuffer.
+
+On x86_64 UEFI, `kernel.efi` is entered in 64-bit long mode. After `ExitBootServices()`, the kernel now installs a minimal local GDT, reloads `CS` to `0x08`, installs a 256-entry IDT, and verifies it with a software breakpoint (`int3`). The vector 3 handler records vector/count/RIP/CS/RFLAGS and returns with `iretq`; the screen must show `IDT SELF-TEST: BP HANDLED` and `AFTER INT3: YES`.
+
+Important implementation detail: do not pass assembly ISR labels to `set_idt_gate()` as normal C function pointers in the current `-fpic` PE/COFF build. That produced a final binary that read the first bytes at the ISR label as the handler address. Use explicit RIP-relative `lea isr_breakpoint(%rip), reg` / `lea isr_unhandled(%rip), reg` helpers to get ISR addresses for IDT entries.
+
+The kernel still inherits UEFI page tables and stack. It does not yet install its own page tables, scheduler, or memory manager.
 
 ## HDMI Capture Card
 

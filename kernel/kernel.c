@@ -141,6 +141,64 @@ typedef struct {
     UINT32 ext_edx;
 } cpu_info_t;
 
+typedef struct {
+    UINT16 offset_low;
+    UINT16 selector;
+    UINT8 ist;
+    UINT8 type_attr;
+    UINT16 offset_mid;
+    UINT32 offset_high;
+    UINT32 zero;
+} __attribute__((packed)) idt_entry_t;
+
+typedef struct {
+    UINT16 limit;
+    UINT64 base;
+} __attribute__((packed)) descriptor_table_ptr_t;
+
+typedef struct {
+    volatile UINT32 vector;
+    volatile UINT32 count;
+    volatile UINT64 rip;
+    volatile UINT64 cs;
+    volatile UINT64 rflags;
+} interrupt_trace_t;
+
+static idt_entry_t idt[256];
+static UINT64 gdt[3] __attribute__((aligned(8))) = {
+    0x0000000000000000ULL,
+    0x00af9a000000ffffULL,
+    0x00cf92000000ffffULL,
+};
+static interrupt_trace_t interrupt_trace;
+
+extern void isr_breakpoint(void);
+extern void isr_unhandled(void);
+
+__asm__(
+    ".text\n"
+    ".global isr_breakpoint\n"
+    "isr_breakpoint:\n"
+    "    pushq %rax\n"
+    "    movq 8(%rsp), %rax\n"
+    "    movq %rax, interrupt_trace+8(%rip)\n"
+    "    movq 16(%rsp), %rax\n"
+    "    movq %rax, interrupt_trace+16(%rip)\n"
+    "    movq 24(%rsp), %rax\n"
+    "    movq %rax, interrupt_trace+24(%rip)\n"
+    "    movl $3, interrupt_trace(%rip)\n"
+    "    movl interrupt_trace+4(%rip), %eax\n"
+    "    addl $1, %eax\n"
+    "    movl %eax, interrupt_trace+4(%rip)\n"
+    "    popq %rax\n"
+    "    iretq\n"
+    ".global isr_unhandled\n"
+    "isr_unhandled:\n"
+    "    cli\n"
+    "1:\n"
+    "    hlt\n"
+    "    jmp 1b\n");
+
 static void cpuid(UINT32 leaf, UINT32 subleaf, UINT32 *a, UINT32 *b, UINT32 *c, UINT32 *d) {
     __asm__ __volatile__(
         "cpuid"
@@ -178,6 +236,16 @@ static char *append_dec(char *p, UINT32 value) {
     }
     while (n > 0) {
         *p++ = tmp[--n];
+    }
+    *p = 0;
+    return p;
+}
+
+static char *append_hex64(char *p, UINT64 value) {
+    static const char digits[] = "0123456789ABCDEF";
+    p = append_str(p, "0X");
+    for (int shift = 60; shift >= 0; shift -= 4) {
+        *p++ = digits[(value >> shift) & 0xf];
     }
     *p = 0;
     return p;
@@ -270,6 +338,84 @@ static void make_cpu_line(char *line, const char *label, UINT32 value) {
     char *p = line;
     p = append_str(p, label);
     p = append_dec(p, value);
+}
+
+static UINT16 read_cs(void) {
+    UINT16 cs;
+    __asm__ __volatile__("mov %%cs, %0" : "=r"(cs));
+    return cs;
+}
+
+static void install_gdt(void) {
+    descriptor_table_ptr_t gdtr;
+    gdtr.limit = (UINT16)(sizeof(gdt) - 1);
+    gdtr.base = (UINT64)(UINTN)gdt;
+
+    __asm__ __volatile__(
+        "cli\n"
+        "lgdt %0\n"
+        "pushq $0x08\n"
+        "leaq 1f(%%rip), %%rax\n"
+        "pushq %%rax\n"
+        "lretq\n"
+        "1:\n"
+        "movw $0x10, %%ax\n"
+        "movw %%ax, %%ds\n"
+        "movw %%ax, %%es\n"
+        "movw %%ax, %%ss\n"
+        :
+        : "m"(gdtr)
+        : "rax", "memory");
+}
+
+static UINT64 isr_breakpoint_addr(void) {
+    UINT64 addr;
+    __asm__ __volatile__("leaq isr_breakpoint(%%rip), %0" : "=r"(addr));
+    return addr;
+}
+
+static UINT64 isr_unhandled_addr(void) {
+    UINT64 addr;
+    __asm__ __volatile__("leaq isr_unhandled(%%rip), %0" : "=r"(addr));
+    return addr;
+}
+
+static void set_idt_gate(UINT32 vector, UINT64 addr, UINT16 selector, UINT8 type_attr) {
+    idt[vector].offset_low = (UINT16)(addr & 0xffff);
+    idt[vector].selector = selector;
+    idt[vector].ist = 0;
+    idt[vector].type_attr = type_attr;
+    idt[vector].offset_mid = (UINT16)((addr >> 16) & 0xffff);
+    idt[vector].offset_high = (UINT32)(addr >> 32);
+    idt[vector].zero = 0;
+}
+
+static void install_idt(void) {
+    UINT16 cs = read_cs();
+    UINT64 unhandled_addr = isr_unhandled_addr();
+
+    for (UINT32 vector = 0; vector < 256; vector++) {
+        set_idt_gate(vector, unhandled_addr, cs, 0x8e);
+    }
+    set_idt_gate(3, isr_breakpoint_addr(), cs, 0xef);
+
+    descriptor_table_ptr_t idtr;
+    idtr.limit = (UINT16)(sizeof(idt) - 1);
+    idtr.base = (UINT64)(UINTN)idt;
+
+    __asm__ __volatile__("cli; lidt %0" : : "m"(idtr) : "memory");
+}
+
+static int run_idt_self_test(void) {
+    interrupt_trace.vector = 0;
+    interrupt_trace.count = 0;
+    interrupt_trace.rip = 0;
+    interrupt_trace.cs = 0;
+    interrupt_trace.rflags = 0;
+
+    __asm__ __volatile__("int3" : : : "memory");
+
+    return interrupt_trace.vector == 3 && interrupt_trace.count == 1;
 }
 
 static void halt_forever(void) {
@@ -365,6 +511,11 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE image, EFI_SYSTEM_TABLE *st) {
     char line[160];
     char *p;
     int first;
+    int idt_ok;
+
+    install_gdt();
+    install_idt();
+    idt_ok = run_idt_self_test();
 
     collect_cpu_info(&cpu);
     clear_screen(&fb, bg);
@@ -376,6 +527,26 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE image, EFI_SYSTEM_TABLE *st) {
     draw_line(&fb, 48, &y, "ARCHITECTURE: X86_64", fg, bg, info_scale);
     draw_line(&fb, 48, &y, "CPU OP-MODES: 32-BIT 64-BIT", fg, bg, info_scale);
     draw_line(&fb, 48, &y, "BYTE ORDER: LITTLE ENDIAN", fg, bg, info_scale);
+    draw_line(&fb, 48, &y, "GDT: INSTALLED", accent, bg, info_scale);
+    draw_line(&fb, 48, &y, "IDT: INSTALLED", accent, bg, info_scale);
+    draw_line(&fb, 48, &y, idt_ok ? "IDT SELF-TEST: BP HANDLED" : "IDT SELF-TEST: FAILED", accent, bg, info_scale);
+    draw_line(&fb, 48, &y, idt_ok ? "AFTER INT3: YES" : "AFTER INT3: NO", accent, bg, info_scale);
+
+    p = append_str(line, "IDT VECTOR: ");
+    p = append_dec(p, interrupt_trace.vector);
+    p = append_str(p, "  COUNT: ");
+    append_dec(p, interrupt_trace.count);
+    draw_line(&fb, 48, &y, line, muted, bg, info_scale);
+
+    p = append_str(line, "INT3 RIP: ");
+    append_hex64(p, interrupt_trace.rip);
+    draw_line(&fb, 48, &y, line, muted, bg, info_scale);
+
+    p = append_str(line, "INT3 CS: ");
+    p = append_hex64(p, interrupt_trace.cs);
+    p = append_str(p, "  RFLAGS: ");
+    append_hex64(p, interrupt_trace.rflags);
+    draw_line(&fb, 48, &y, line, muted, bg, info_scale);
 
     p = append_str(line, "VENDOR ID: ");
     append_str(p, cpu.vendor);
