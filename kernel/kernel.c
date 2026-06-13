@@ -5,16 +5,52 @@ typedef struct {
     UINT32 width;
     UINT32 height;
     UINT32 stride;
+    UINTN size;
     EFI_GRAPHICS_PIXEL_FORMAT format;
 } framebuffer_t;
 
 typedef struct {
     EFI_MEMORY_DESCRIPTOR *descriptors;
     UINTN map_size;
+    UINTN map_capacity;
     UINTN descriptor_size;
     UINT32 descriptor_version;
     UINTN descriptor_count;
 } efi_memory_map_t;
+
+typedef struct {
+    UINT64 cr3;
+    UINT64 loaded_cr3;
+    UINT64 pool_start;
+    UINT64 pool_end;
+    UINT64 pool_next;
+    UINT64 max_identity_end;
+    UINT64 reserved_pages;
+    UINT64 allocated_pages;
+    UINT64 mapped_pages;
+    UINT64 mapped_ranges;
+    UINT32 error;
+    UINT32 idt_self_test_ok;
+} paging_info_t;
+
+#define PAGE_SIZE_4K 4096ULL
+#define PAGE_TABLE_ENTRIES 512ULL
+#define LOW_CANONICAL_LIMIT 0x0000800000000000ULL
+#define PTE_PRESENT 0x001ULL
+#define PTE_RW 0x002ULL
+#define PTE_PWT 0x008ULL
+#define PTE_PCD 0x010ULL
+#define PTE_ADDR_MASK 0x000FFFFFFFFFF000ULL
+
+enum {
+    PAGING_OK = 0,
+    PAGING_ERR_LA57 = 1,
+    PAGING_ERR_RANGE = 2,
+    PAGING_ERR_NO_POOL = 3,
+    PAGING_ERR_POOL_EMPTY = 4,
+    PAGING_ERR_TABLE_ENTRY = 5,
+    PAGING_ERR_MAP_FULL = 6,
+};
 
 static UINT32 color(framebuffer_t *fb, UINT8 r, UINT8 g, UINT8 b) {
     if (fb->format == PixelRedGreenBlueReserved8BitPerColor) {
@@ -436,6 +472,320 @@ static EFI_MEMORY_DESCRIPTOR *memory_desc_at(efi_memory_map_t *map, UINTN index)
     return (EFI_MEMORY_DESCRIPTOR *)((UINT8 *)map->descriptors + index * map->descriptor_size);
 }
 
+static int append_memory_descriptor(efi_memory_map_t *map, EFI_MEMORY_DESCRIPTOR *desc) {
+    UINTN used = map->descriptor_count * map->descriptor_size;
+    if (used + map->descriptor_size > map->map_capacity) {
+        return 0;
+    }
+
+    UINT8 *dst = (UINT8 *)map->descriptors + used;
+    for (UINTN i = 0; i < map->descriptor_size; i++) {
+        dst[i] = 0;
+    }
+
+    UINTN copy_size = sizeof(*desc);
+    if (copy_size > map->descriptor_size) {
+        copy_size = map->descriptor_size;
+    }
+    for (UINTN i = 0; i < copy_size; i++) {
+        dst[i] = ((UINT8 *)desc)[i];
+    }
+
+    map->descriptor_count++;
+    map->map_size += map->descriptor_size;
+    return 1;
+}
+
+static UINT64 read_cr3(void) {
+    UINT64 value;
+    __asm__ __volatile__("mov %%cr3, %0" : "=r"(value));
+    return value;
+}
+
+static UINT64 read_cr4(void) {
+    UINT64 value;
+    __asm__ __volatile__("mov %%cr4, %0" : "=r"(value));
+    return value;
+}
+
+static void write_cr3(UINT64 value) {
+    __asm__ __volatile__("mov %0, %%cr3" : : "r"(value) : "memory");
+}
+
+static UINT64 align_down_4k(UINT64 value) {
+    return value & ~(PAGE_SIZE_4K - 1);
+}
+
+static int align_up_4k_checked(UINT64 value, UINT64 *out) {
+    if (value == 0) {
+        *out = 0;
+        return 1;
+    }
+    if (value > (~(UINT64)0) - (PAGE_SIZE_4K - 1)) {
+        return 0;
+    }
+    *out = (value + PAGE_SIZE_4K - 1) & ~(PAGE_SIZE_4K - 1);
+    return 1;
+}
+
+static UINT64 div_round_up64(UINT64 value, UINT64 divisor) {
+    return value == 0 ? 0 : ((value - 1) / divisor) + 1;
+}
+
+static int descriptor_end_checked(EFI_MEMORY_DESCRIPTOR *desc, UINT64 *end) {
+    if (desc->NumberOfPages > ((~(UINT64)0) - desc->PhysicalStart) / PAGE_SIZE_4K) {
+        return 0;
+    }
+    *end = desc->PhysicalStart + desc->NumberOfPages * PAGE_SIZE_4K;
+    return 1;
+}
+
+static UINT64 framebuffer_size_bytes(framebuffer_t *fb) {
+    if (fb->size != 0) {
+        return fb->size;
+    }
+    return (UINT64)fb->stride * (UINT64)fb->height * sizeof(UINT32);
+}
+
+static UINT64 estimate_identity_page_table_pages(UINT64 max_end) {
+    UINT64 mapped_pages = div_round_up64(max_end, PAGE_SIZE_4K);
+    UINT64 pt_pages = div_round_up64(mapped_pages, PAGE_TABLE_ENTRIES);
+    UINT64 pd_pages = div_round_up64(mapped_pages, PAGE_TABLE_ENTRIES * PAGE_TABLE_ENTRIES);
+    UINT64 pdpt_pages = div_round_up64(mapped_pages, PAGE_TABLE_ENTRIES * PAGE_TABLE_ENTRIES * PAGE_TABLE_ENTRIES);
+
+    return 1 + pdpt_pages + pd_pages + pt_pages + 16;
+}
+
+static void zero_page_4k(UINT64 phys) {
+    UINT64 *page = (UINT64 *)(UINTN)phys;
+    for (UINTN i = 0; i < PAGE_TABLE_ENTRIES; i++) {
+        page[i] = 0;
+    }
+}
+
+static UINT64 alloc_page_table_page(paging_info_t *info) {
+    if (info->pool_next > info->pool_end - PAGE_SIZE_4K) {
+        info->error = PAGING_ERR_POOL_EMPTY;
+        return 0;
+    }
+
+    UINT64 phys = info->pool_next;
+    info->pool_next += PAGE_SIZE_4K;
+    info->allocated_pages++;
+    zero_page_4k(phys);
+    return phys;
+}
+
+static int select_page_table_pool(efi_memory_map_t *map, UINT64 pool_pages, paging_info_t *info) {
+    UINT64 selected_start = 0;
+    UINT64 selected_end = 0;
+    UINTN selected_index = 0;
+    int found = 0;
+
+    for (UINTN i = 0; i < map->descriptor_count; i++) {
+        EFI_MEMORY_DESCRIPTOR *desc = memory_desc_at(map, i);
+        UINT64 end = 0;
+
+        if (desc->Type != EfiConventionalMemory || desc->NumberOfPages < pool_pages) {
+            continue;
+        }
+        if (!descriptor_end_checked(desc, &end)) {
+            info->error = PAGING_ERR_RANGE;
+            return 0;
+        }
+        if (!found || desc->PhysicalStart < selected_start) {
+            selected_start = desc->PhysicalStart;
+            selected_end = end;
+            selected_index = i;
+            found = 1;
+        }
+    }
+
+    if (!found) {
+        info->error = PAGING_ERR_NO_POOL;
+        return 0;
+    }
+
+    info->pool_end = selected_end;
+    info->pool_start = selected_end - pool_pages * PAGE_SIZE_4K;
+    info->pool_next = info->pool_start;
+    info->reserved_pages = pool_pages;
+
+    EFI_MEMORY_DESCRIPTOR *selected = memory_desc_at(map, selected_index);
+    if (selected->NumberOfPages == pool_pages) {
+        selected->Type = EfiLoaderData;
+    } else {
+        EFI_MEMORY_DESCRIPTOR pool_desc = *selected;
+        selected->NumberOfPages -= pool_pages;
+        pool_desc.Type = EfiLoaderData;
+        pool_desc.PhysicalStart = info->pool_start;
+        pool_desc.VirtualStart = 0;
+        pool_desc.NumberOfPages = pool_pages;
+        if (!append_memory_descriptor(map, &pool_desc)) {
+            info->error = PAGING_ERR_MAP_FULL;
+            return 0;
+        }
+    }
+
+    return 1;
+}
+
+static int ensure_next_table(paging_info_t *info, UINT64 *table, UINT64 index, UINT64 **next_table) {
+    UINT64 entry = table[index];
+
+    if (entry & PTE_PRESENT) {
+        *next_table = (UINT64 *)(UINTN)(entry & PTE_ADDR_MASK);
+        return 1;
+    }
+
+    UINT64 phys = alloc_page_table_page(info);
+    if (phys == 0) {
+        return 0;
+    }
+
+    table[index] = phys | PTE_PRESENT | PTE_RW;
+    *next_table = (UINT64 *)(UINTN)phys;
+    return 1;
+}
+
+static int map_identity_range_4k(paging_info_t *info, UINT64 start, UINT64 bytes, UINT64 flags) {
+    if (bytes == 0) {
+        return 1;
+    }
+    if (start > (~(UINT64)0) - bytes) {
+        info->error = PAGING_ERR_RANGE;
+        return 0;
+    }
+
+    UINT64 raw_end = start + bytes;
+    UINT64 map_start = align_down_4k(start);
+    UINT64 map_end = 0;
+    if (!align_up_4k_checked(raw_end, &map_end) || map_end > LOW_CANONICAL_LIMIT) {
+        info->error = PAGING_ERR_RANGE;
+        return 0;
+    }
+
+    info->mapped_ranges++;
+    for (UINT64 addr = map_start; addr < map_end; addr += PAGE_SIZE_4K) {
+        UINT64 pml4_index = (addr >> 39) & 0x1ff;
+        UINT64 pdpt_index = (addr >> 30) & 0x1ff;
+        UINT64 pd_index = (addr >> 21) & 0x1ff;
+        UINT64 pt_index = (addr >> 12) & 0x1ff;
+        UINT64 *pml4 = (UINT64 *)(UINTN)info->cr3;
+        UINT64 *pdpt = 0;
+        UINT64 *pd = 0;
+        UINT64 *pt = 0;
+
+        if (!ensure_next_table(info, pml4, pml4_index, &pdpt) ||
+            !ensure_next_table(info, pdpt, pdpt_index, &pd) ||
+            !ensure_next_table(info, pd, pd_index, &pt)) {
+            return 0;
+        }
+
+        UINT64 entry = pt[pt_index];
+        if (entry & PTE_PRESENT) {
+            if ((entry & PTE_ADDR_MASK) != (addr & PTE_ADDR_MASK)) {
+                info->error = PAGING_ERR_TABLE_ENTRY;
+                return 0;
+            }
+            pt[pt_index] = entry | flags;
+        } else {
+            pt[pt_index] = (addr & PTE_ADDR_MASK) | flags;
+            info->mapped_pages++;
+        }
+    }
+
+    return 1;
+}
+
+static UINT64 page_flags_for_memory_type(UINT32 type) {
+    UINT64 flags = PTE_PRESENT | PTE_RW;
+    if (type == EfiMemoryMappedIO || type == EfiMemoryMappedIOPortSpace) {
+        flags |= PTE_PWT | PTE_PCD;
+    }
+    return flags;
+}
+
+static int setup_kernel_paging(efi_memory_map_t *map, framebuffer_t *fb, paging_info_t *info) {
+    for (UINTN i = 0; i < sizeof(*info); i++) {
+        ((UINT8 *)info)[i] = 0;
+    }
+
+    if (read_cr4() & (1ULL << 12)) {
+        info->error = PAGING_ERR_LA57;
+        return 0;
+    }
+
+    UINT64 max_end = 0;
+    for (UINTN i = 0; i < map->descriptor_count; i++) {
+        EFI_MEMORY_DESCRIPTOR *desc = memory_desc_at(map, i);
+        UINT64 end = 0;
+
+        if (!descriptor_end_checked(desc, &end) || end > LOW_CANONICAL_LIMIT) {
+            info->error = PAGING_ERR_RANGE;
+            return 0;
+        }
+        if (end > max_end) {
+            max_end = end;
+        }
+    }
+
+    UINT64 fb_start = (UINT64)(UINTN)fb->base;
+    UINT64 fb_bytes = framebuffer_size_bytes(fb);
+    if (fb_start > (~(UINT64)0) - fb_bytes) {
+        info->error = PAGING_ERR_RANGE;
+        return 0;
+    }
+    UINT64 fb_end = fb_start + fb_bytes;
+    if (!align_up_4k_checked(fb_end, &fb_end) || fb_end > LOW_CANONICAL_LIMIT) {
+        info->error = PAGING_ERR_RANGE;
+        return 0;
+    }
+    if (fb_end > max_end) {
+        max_end = fb_end;
+    }
+
+    info->max_identity_end = max_end;
+    UINT64 pool_pages = estimate_identity_page_table_pages(max_end);
+    if (!select_page_table_pool(map, pool_pages, info)) {
+        return 0;
+    }
+
+    info->cr3 = alloc_page_table_page(info);
+    if (info->cr3 == 0) {
+        return 0;
+    }
+
+    for (UINTN i = 0; i < map->descriptor_count; i++) {
+        EFI_MEMORY_DESCRIPTOR *desc = memory_desc_at(map, i);
+        UINT64 bytes = desc->NumberOfPages * PAGE_SIZE_4K;
+        if (!map_identity_range_4k(info, desc->PhysicalStart, bytes, page_flags_for_memory_type(desc->Type))) {
+            return 0;
+        }
+    }
+
+    if (!map_identity_range_4k(info, fb_start, fb_bytes, PTE_PRESENT | PTE_RW | PTE_PWT | PTE_PCD)) {
+        return 0;
+    }
+
+    write_cr3(info->cr3);
+    info->loaded_cr3 = read_cr3();
+    return 1;
+}
+
+static const char *paging_error_name(UINT32 error) {
+    switch (error) {
+    case PAGING_OK: return "OK";
+    case PAGING_ERR_LA57: return "LA57";
+    case PAGING_ERR_RANGE: return "RANGE";
+    case PAGING_ERR_NO_POOL: return "NO-POOL";
+    case PAGING_ERR_POOL_EMPTY: return "POOL-EMPTY";
+    case PAGING_ERR_TABLE_ENTRY: return "TABLE-ENTRY";
+    case PAGING_ERR_MAP_FULL: return "MAP-FULL";
+    default: return "UNKNOWN";
+    }
+}
+
 static UINT16 read_cs(void) {
     UINT16 cs;
     __asm__ __volatile__("mov %%cs, %0" : "=r"(cs));
@@ -537,8 +887,8 @@ static UINT32 memory_line_color(EFI_MEMORY_DESCRIPTOR *desc, UINT32 fg, UINT32 m
     }
 }
 
-static void draw_memory_map(framebuffer_t *fb, efi_memory_map_t *map, UINT32 fg, UINT32 muted, UINT32 accent,
-                            UINT32 warn, UINT32 bg) {
+static void draw_memory_map(framebuffer_t *fb, efi_memory_map_t *map, paging_info_t *paging, UINT32 fg,
+                            UINT32 muted, UINT32 accent, UINT32 warn, UINT32 bg) {
     UINT64 conventional_pages = 0;
     UINT64 loader_pages = 0;
     UINT64 boot_pages = 0;
@@ -594,6 +944,34 @@ static void draw_memory_map(framebuffer_t *fb, efi_memory_map_t *map, UINT32 fg,
     UINT32 y = 42;
     draw_text(fb, 48, y, "UEFI MEMORY MAP", fg, bg, 4);
     y += 58;
+
+    if (paging) {
+        p = append_str(line, "PAGING: 4K IDENTITY  CR3: ");
+        p = append_hex64(p, paging->loaded_cr3);
+        p = append_str(p, "  IDT: ");
+        append_str(p, paging->idt_self_test_ok ? "OK" : "FAIL");
+        draw_line(fb, 48, &y, line, accent, bg, 2);
+
+        p = append_str(line, "PT POOL: ");
+        p = append_hex64(p, paging->pool_start);
+        p = append_str(p, "-");
+        p = append_hex64(p, paging->pool_end - 1);
+        p = append_str(p, "  RESERVED: ");
+        p = append_dec64(p, paging->reserved_pages);
+        p = append_str(p, "  USED: ");
+        append_dec64(p, paging->allocated_pages);
+        draw_line(fb, 48, &y, line, fg, bg, 2);
+
+        p = append_str(line, "IDENTITY END: ");
+        p = append_hex64(p, paging->max_identity_end);
+        p = append_str(p, "  MAPPED PAGES: ");
+        p = append_dec64(p, paging->mapped_pages);
+        p = append_str(p, "  RANGES: ");
+        append_dec64(p, paging->mapped_ranges);
+        draw_line(fb, 48, &y, line, fg, bg, 2);
+
+        y += 8;
+    }
 
     p = append_str(line, "DESCRIPTORS: ");
     p = append_dec64(p, map->descriptor_count);
@@ -731,6 +1109,30 @@ static void draw_memory_map(framebuffer_t *fb, efi_memory_map_t *map, UINT32 fg,
     }
 }
 
+static void draw_paging_failure(framebuffer_t *fb, paging_info_t *paging, UINT32 fg, UINT32 warn, UINT32 bg) {
+    char line[192];
+    char *p;
+    UINT32 y = 48;
+
+    clear_screen(fb, bg);
+    draw_text(fb, 48, y, "PAGING FAILED", warn, bg, 4);
+    y += 64;
+
+    p = append_str(line, "ERROR: ");
+    p = append_str(p, paging_error_name(paging->error));
+    p = append_str(p, "  RESERVED PAGES: ");
+    p = append_dec64(p, paging->reserved_pages);
+    p = append_str(p, "  USED: ");
+    append_dec64(p, paging->allocated_pages);
+    draw_line(fb, 48, &y, line, fg, bg, 2);
+
+    p = append_str(line, "PT POOL: ");
+    p = append_hex64(p, paging->pool_start);
+    p = append_str(p, "-");
+    append_hex64(p, paging->pool_end);
+    draw_line(fb, 48, &y, line, fg, bg, 2);
+}
+
 static void halt_forever(void) {
     for (;;) {
         __asm__ __volatile__("cli; hlt");
@@ -770,6 +1172,7 @@ static EFI_STATUS exit_boot_services(EFI_HANDLE image, EFI_BOOT_SERVICES *bs, ef
         if (status == EFI_SUCCESS) {
             out_map->descriptors = map;
             out_map->map_size = this_map_size;
+            out_map->map_capacity = map_size;
             out_map->descriptor_size = desc_size;
             out_map->descriptor_version = desc_version;
             out_map->descriptor_count = this_map_size / desc_size;
@@ -809,11 +1212,13 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE image, EFI_SYSTEM_TABLE *st) {
     fb.width = gop->Mode->Info->HorizontalResolution;
     fb.height = gop->Mode->Info->VerticalResolution;
     fb.stride = gop->Mode->Info->PixelsPerScanLine;
+    fb.size = gop->Mode->FrameBufferSize;
     fb.format = gop->Mode->Info->PixelFormat;
 
     efi_memory_map_t memory_map;
     memory_map.descriptors = 0;
     memory_map.map_size = 0;
+    memory_map.map_capacity = 0;
     memory_map.descriptor_size = 0;
     memory_map.descriptor_version = 0;
     memory_map.descriptor_count = 0;
@@ -834,9 +1239,16 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE image, EFI_SYSTEM_TABLE *st) {
 
     install_gdt();
     install_idt();
-    run_idt_self_test();
+
+    paging_info_t paging;
+    if (!setup_kernel_paging(&memory_map, &fb, &paging)) {
+        draw_paging_failure(&fb, &paging, fg, warn, bg);
+        halt_forever();
+    }
+
+    paging.idt_self_test_ok = run_idt_self_test() ? 1U : 0U;
     clear_screen(&fb, bg);
-    draw_memory_map(&fb, &memory_map, fg, muted, accent, warn, bg);
+    draw_memory_map(&fb, &memory_map, &paging, fg, muted, accent, warn, bg);
 
     halt_forever();
     return EFI_SUCCESS;
