@@ -57,6 +57,10 @@ typedef struct {
 #define CPU_IST_FAULT 1
 #define CPU_IST_DOUBLE_FAULT 2
 #define CPU_FAULT_STACK_SIZE (16 * 1024)
+#define ACPI_MAX_CPUS 32
+#define ACPI_MAX_RSDP_LENGTH 4096U
+#define ACPI_MAX_SDT_LENGTH (1024U * 1024U)
+#define ACPI_CPU_LIST_OUTPUT_LIMIT 5
 
 enum {
     PAGING_OK = 0,
@@ -66,6 +70,18 @@ enum {
     PAGING_ERR_POOL_EMPTY = 4,
     PAGING_ERR_TABLE_ENTRY = 5,
     PAGING_ERR_MAP_FULL = 6,
+};
+
+enum {
+    ACPI_OK = 0,
+    ACPI_ERR_NO_RSDP = 1,
+    ACPI_ERR_BAD_RSDP = 2,
+    ACPI_ERR_NO_XSDT = 3,
+    ACPI_ERR_BAD_XSDT = 4,
+    ACPI_ERR_NO_MADT = 5,
+    ACPI_ERR_BAD_MADT = 6,
+    ACPI_ERR_BAD_ENTRY = 7,
+    ACPI_ERR_RANGE = 8,
 };
 
 static UINT32 color(framebuffer_t *fb, UINT8 r, UINT8 g, UINT8 b) {
@@ -236,6 +252,59 @@ typedef struct {
     UINT8 fault_stack[CPU_FAULT_STACK_SIZE] __attribute__((aligned(16)));
     UINT8 double_fault_stack[CPU_FAULT_STACK_SIZE] __attribute__((aligned(16)));
 } __attribute__((aligned(16))) cpu_local_t;
+
+typedef struct {
+    EFI_GUID VendorGuid;
+    void *VendorTable;
+} efi_configuration_table_t;
+
+typedef struct {
+    char signature[8];
+    UINT8 checksum;
+    char oem_id[6];
+    UINT8 revision;
+    UINT32 rsdt_address;
+    UINT32 length;
+    UINT64 xsdt_address;
+    UINT8 extended_checksum;
+    UINT8 reserved[3];
+} __attribute__((packed)) acpi_rsdp_t;
+_Static_assert(sizeof(acpi_rsdp_t) == 36, "ACPI RSDP layout must match ACPI 2.0");
+
+typedef struct {
+    char signature[4];
+    UINT32 length;
+    UINT8 revision;
+    UINT8 checksum;
+    char oem_id[6];
+    char oem_table_id[8];
+    UINT32 oem_revision;
+    UINT32 creator_id;
+    UINT32 creator_revision;
+} __attribute__((packed)) acpi_sdt_header_t;
+_Static_assert(sizeof(acpi_sdt_header_t) == 36, "ACPI SDT header layout must match ACPI");
+
+typedef struct {
+    UINT32 acpi_uid;
+    UINT32 apic_id;
+    UINT32 flags;
+    UINT8 x2apic;
+} acpi_cpu_t;
+
+typedef struct {
+    UINT64 rsdp;
+    UINT64 xsdt;
+    UINT64 madt;
+    UINT64 local_apic_base;
+    UINT32 madt_flags;
+    UINT32 bsp_apic_id;
+    UINT32 rsdp_revision;
+    UINT32 xsdt_entries;
+    UINT32 enabled_cpu_count;
+    UINT32 stored_cpu_count;
+    UINT32 error;
+    acpi_cpu_t cpus[ACPI_MAX_CPUS];
+} acpi_info_t;
 
 typedef struct {
     volatile UINT32 vector;
@@ -1126,6 +1195,334 @@ static void run_fault_test_if_enabled(void) {
 #endif
 }
 
+static int guid_equal(EFI_GUID *a, EFI_GUID *b) {
+    if (a->Data1 != b->Data1 || a->Data2 != b->Data2 || a->Data3 != b->Data3) {
+        return 0;
+    }
+    for (UINTN i = 0; i < sizeof(a->Data4); i++) {
+        if (a->Data4[i] != b->Data4[i]) {
+            return 0;
+        }
+    }
+    return 1;
+}
+
+static UINT64 find_acpi_rsdp(EFI_SYSTEM_TABLE *st) {
+    static EFI_GUID acpi_20_guid = {
+        0x8868e871,
+        0xe4f1,
+        0x11d3,
+        {0xbc, 0x22, 0x00, 0x80, 0xc7, 0x3c, 0x88, 0x81},
+    };
+    static EFI_GUID acpi_10_guid = {
+        0xeb9d2d30,
+        0x2d88,
+        0x11d3,
+        {0x9a, 0x16, 0x00, 0x90, 0x27, 0x3f, 0xc1, 0x4d},
+    };
+    UINT64 fallback = 0;
+
+    if (!st->ConfigurationTable || st->NumberOfTableEntries == 0) {
+        return 0;
+    }
+
+    efi_configuration_table_t *tables = (efi_configuration_table_t *)st->ConfigurationTable;
+    for (UINTN i = 0; i < st->NumberOfTableEntries; i++) {
+        if (guid_equal(&tables[i].VendorGuid, &acpi_20_guid)) {
+            return (UINT64)(UINTN)tables[i].VendorTable;
+        }
+        if (!fallback && guid_equal(&tables[i].VendorGuid, &acpi_10_guid)) {
+            fallback = (UINT64)(UINTN)tables[i].VendorTable;
+        }
+    }
+
+    return fallback;
+}
+
+static int bytes_equal(const char *a, const char *b, UINTN count) {
+    for (UINTN i = 0; i < count; i++) {
+        if (a[i] != b[i]) {
+            return 0;
+        }
+    }
+    return 1;
+}
+
+static UINT32 read_le32(UINT8 *p) {
+    return ((UINT32)p[0]) | ((UINT32)p[1] << 8) | ((UINT32)p[2] << 16) | ((UINT32)p[3] << 24);
+}
+
+static UINT64 read_le64(UINT8 *p) {
+    return ((UINT64)read_le32(p)) | ((UINT64)read_le32(p + 4) << 32);
+}
+
+static int checksum_ok(UINT8 *p, UINT32 length) {
+    UINT8 sum = 0;
+    for (UINT32 i = 0; i < length; i++) {
+        sum = (UINT8)(sum + p[i]);
+    }
+    return sum == 0;
+}
+
+static int memory_map_contains_range(efi_memory_map_t *map, UINT64 start, UINT64 length) {
+    if (length == 0) {
+        return 1;
+    }
+    if (start > (~(UINT64)0) - length) {
+        return 0;
+    }
+
+    UINT64 end = start + length;
+    for (UINTN i = 0; i < map->descriptor_count; i++) {
+        EFI_MEMORY_DESCRIPTOR *desc = memory_desc_at(map, i);
+        UINT64 desc_end = 0;
+        if (!descriptor_end_checked(desc, &desc_end)) {
+            continue;
+        }
+        if (start >= desc->PhysicalStart && end <= desc_end) {
+            return 1;
+        }
+    }
+
+    return 0;
+}
+
+static UINT32 read_bsp_apic_id(void) {
+    UINT32 a = 0;
+    UINT32 b = 0;
+    UINT32 c = 0;
+    UINT32 d = 0;
+
+    cpuid(0, 0, &a, &b, &c, &d);
+    if (a >= 0x0bU) {
+        cpuid(0x0bU, 0, &a, &b, &c, &d);
+        if (b != 0) {
+            return d;
+        }
+    }
+
+    cpuid(1, 0, &a, &b, &c, &d);
+    return (b >> 24) & 0xffU;
+}
+
+static void add_acpi_cpu(acpi_info_t *info, UINT32 uid, UINT32 apic_id, UINT32 flags, UINT8 x2apic) {
+    info->enabled_cpu_count++;
+    if (info->stored_cpu_count >= ACPI_MAX_CPUS) {
+        return;
+    }
+
+    acpi_cpu_t *cpu = &info->cpus[info->stored_cpu_count++];
+    cpu->acpi_uid = uid;
+    cpu->apic_id = apic_id;
+    cpu->flags = flags;
+    cpu->x2apic = x2apic;
+}
+
+static void parse_madt(efi_memory_map_t *map, acpi_info_t *info, acpi_sdt_header_t *madt_header) {
+    UINT8 *madt = (UINT8 *)madt_header;
+    UINT32 offset = sizeof(acpi_sdt_header_t) + 8;
+    UINT64 madt_addr = (UINT64)(UINTN)madt_header;
+
+    info->madt = madt_addr;
+    if (madt_header->length < offset || madt_header->length > ACPI_MAX_SDT_LENGTH) {
+        info->error = ACPI_ERR_BAD_MADT;
+        return;
+    }
+    if (!memory_map_contains_range(map, madt_addr, madt_header->length)) {
+        info->error = ACPI_ERR_RANGE;
+        return;
+    }
+    if (!checksum_ok(madt, madt_header->length)) {
+        info->error = ACPI_ERR_BAD_MADT;
+        return;
+    }
+
+    info->local_apic_base = read_le32(madt + sizeof(acpi_sdt_header_t));
+    info->madt_flags = read_le32(madt + sizeof(acpi_sdt_header_t) + 4);
+
+    while (offset < madt_header->length) {
+        UINT8 *entry = madt + offset;
+        UINT8 type = entry[0];
+        UINT8 length = entry[1];
+
+        if (length < 2 || offset + length > madt_header->length) {
+            info->error = ACPI_ERR_BAD_ENTRY;
+            return;
+        }
+
+        if (type == 0 && length >= 8) {
+            UINT32 flags = read_le32(entry + 4);
+            if (flags & 1U) {
+                add_acpi_cpu(info, entry[2], entry[3], flags, 0);
+            }
+        } else if (type == 5 && length >= 12) {
+            info->local_apic_base = read_le64(entry + 4);
+        } else if (type == 9 && length >= 16) {
+            UINT32 flags = read_le32(entry + 8);
+            if (flags & 1U) {
+                add_acpi_cpu(info, read_le32(entry + 12), read_le32(entry + 4), flags, 1);
+            }
+        }
+
+        offset += length;
+    }
+}
+
+static void parse_acpi(UINT64 rsdp_addr, efi_memory_map_t *map, acpi_info_t *info) {
+    zero_memory(info, sizeof(*info));
+    info->bsp_apic_id = read_bsp_apic_id();
+
+    if (rsdp_addr == 0) {
+        info->error = ACPI_ERR_NO_RSDP;
+        return;
+    }
+    info->rsdp = rsdp_addr;
+    if (!memory_map_contains_range(map, rsdp_addr, 20)) {
+        info->error = ACPI_ERR_RANGE;
+        return;
+    }
+
+    acpi_rsdp_t *rsdp = (acpi_rsdp_t *)(UINTN)rsdp_addr;
+    info->rsdp_revision = rsdp->revision;
+
+    if (!bytes_equal(rsdp->signature, "RSD PTR ", 8) || !checksum_ok((UINT8 *)rsdp, 20)) {
+        info->error = ACPI_ERR_BAD_RSDP;
+        return;
+    }
+    if (rsdp->revision < 2) {
+        info->error = ACPI_ERR_NO_XSDT;
+        return;
+    }
+    if (!memory_map_contains_range(map, rsdp_addr, 24)) {
+        info->error = ACPI_ERR_RANGE;
+        return;
+    }
+    UINT32 rsdp_length = read_le32((UINT8 *)rsdp + 20);
+    if (rsdp_length < sizeof(acpi_rsdp_t) || rsdp_length > ACPI_MAX_RSDP_LENGTH) {
+        info->error = ACPI_ERR_BAD_RSDP;
+        return;
+    }
+    if (!memory_map_contains_range(map, rsdp_addr, rsdp_length)) {
+        info->error = ACPI_ERR_RANGE;
+        return;
+    }
+    if (!checksum_ok((UINT8 *)rsdp, rsdp_length)) {
+        info->error = ACPI_ERR_BAD_RSDP;
+        return;
+    }
+    if (rsdp->xsdt_address == 0) {
+        info->error = ACPI_ERR_NO_XSDT;
+        return;
+    }
+    if (!memory_map_contains_range(map, rsdp->xsdt_address, sizeof(acpi_sdt_header_t))) {
+        info->error = ACPI_ERR_RANGE;
+        return;
+    }
+
+    acpi_sdt_header_t *xsdt = (acpi_sdt_header_t *)(UINTN)rsdp->xsdt_address;
+    info->xsdt = rsdp->xsdt_address;
+    if (!bytes_equal(xsdt->signature, "XSDT", 4) || xsdt->length < sizeof(*xsdt) ||
+        xsdt->length > ACPI_MAX_SDT_LENGTH) {
+        info->error = ACPI_ERR_BAD_XSDT;
+        return;
+    }
+    if (!memory_map_contains_range(map, rsdp->xsdt_address, xsdt->length)) {
+        info->error = ACPI_ERR_RANGE;
+        return;
+    }
+    if (!checksum_ok((UINT8 *)xsdt, xsdt->length)) {
+        info->error = ACPI_ERR_BAD_XSDT;
+        return;
+    }
+
+    UINT32 entry_count = (xsdt->length - sizeof(*xsdt)) / sizeof(UINT64);
+    info->xsdt_entries = entry_count;
+    UINT8 *entries = (UINT8 *)xsdt + sizeof(*xsdt);
+    for (UINT32 i = 0; i < entry_count; i++) {
+        UINT64 table_addr = read_le64(entries + i * sizeof(UINT64));
+        if (table_addr == 0) {
+            info->error = ACPI_ERR_RANGE;
+            return;
+        }
+        if (!memory_map_contains_range(map, table_addr, sizeof(acpi_sdt_header_t))) {
+            info->error = ACPI_ERR_RANGE;
+            return;
+        }
+        acpi_sdt_header_t *header = (acpi_sdt_header_t *)(UINTN)table_addr;
+        if (bytes_equal(header->signature, "APIC", 4)) {
+            parse_madt(map, info, header);
+            return;
+        }
+    }
+
+    info->error = ACPI_ERR_NO_MADT;
+}
+
+static const char *acpi_error_name(UINT32 error) {
+    switch (error) {
+    case ACPI_OK: return "OK";
+    case ACPI_ERR_NO_RSDP: return "NO-RSDP";
+    case ACPI_ERR_BAD_RSDP: return "BAD-RSDP";
+    case ACPI_ERR_NO_XSDT: return "NO-XSDT";
+    case ACPI_ERR_BAD_XSDT: return "BAD-XSDT";
+    case ACPI_ERR_NO_MADT: return "NO-MADT";
+    case ACPI_ERR_BAD_MADT: return "BAD-MADT";
+    case ACPI_ERR_BAD_ENTRY: return "BAD-ENTRY";
+    case ACPI_ERR_RANGE: return "RANGE";
+    default: return "UNKNOWN";
+    }
+}
+
+static void draw_acpi_info(framebuffer_t *fb, UINT32 *y, acpi_info_t *acpi, UINT32 fg, UINT32 accent,
+                           UINT32 warn, UINT32 bg) {
+    char line[192];
+    char *p = append_str(line, "ACPI: ");
+    p = append_str(p, acpi_error_name(acpi->error));
+    p = append_str(p, "  RSDP: ");
+    p = append_hex64(p, acpi->rsdp);
+    p = append_str(p, "  XSDT: ");
+    p = append_hex64(p, acpi->xsdt);
+    p = append_str(p, "  ENTRIES: ");
+    append_dec(p, acpi->xsdt_entries);
+    draw_line(fb, 48, y, line, acpi->error == ACPI_OK ? accent : warn, bg, 2);
+
+    p = append_str(line, "MADT: ");
+    p = append_hex64(p, acpi->madt);
+    p = append_str(p, "  LAPIC BASE: ");
+    p = append_hex64(p, acpi->local_apic_base);
+    p = append_str(p, "  FLAGS: ");
+    p = append_hex64(p, acpi->madt_flags);
+    p = append_str(p, "  BSP APIC ID: ");
+    append_dec(p, acpi->bsp_apic_id);
+    draw_line(fb, 48, y, line, fg, bg, 2);
+
+    p = append_str(line, "ENABLED CPU/APIC: ");
+    p = append_dec(p, acpi->enabled_cpu_count);
+    p = append_str(p, "  LIST: ");
+    UINT32 output_count = acpi->stored_cpu_count;
+    if (output_count > ACPI_CPU_LIST_OUTPUT_LIMIT) {
+        output_count = ACPI_CPU_LIST_OUTPUT_LIMIT;
+    }
+    for (UINT32 i = 0; i < output_count; i++) {
+        if (i > 0) {
+            *p++ = ' ';
+            *p = 0;
+        }
+        p = append_dec(p, acpi->cpus[i].acpi_uid);
+        *p++ = '/';
+        *p = 0;
+        p = append_dec(p, acpi->cpus[i].apic_id);
+        if (acpi->cpus[i].x2apic) {
+            p = append_str(p, "(X2)");
+        }
+    }
+    if (acpi->enabled_cpu_count > output_count) {
+        p = append_str(p, " +");
+        append_dec(p, acpi->enabled_cpu_count - output_count);
+    }
+    draw_line(fb, 48, y, line, fg, bg, 2);
+}
+
 static int draw_map_line(framebuffer_t *fb, UINT32 *y, const char *s, UINT32 fg, UINT32 bg) {
     if (*y + 20 > fb->height) {
         return 0;
@@ -1149,8 +1546,9 @@ static UINT32 memory_line_color(EFI_MEMORY_DESCRIPTOR *desc, UINT32 fg, UINT32 m
     }
 }
 
-static void draw_memory_map(framebuffer_t *fb, efi_memory_map_t *map, paging_info_t *paging, UINT32 fg,
-                            UINT32 muted, UINT32 accent, UINT32 warn, UINT32 bg) {
+static void draw_memory_map(framebuffer_t *fb, efi_memory_map_t *map, paging_info_t *paging,
+                            acpi_info_t *acpi, UINT32 fg, UINT32 muted, UINT32 accent, UINT32 warn,
+                            UINT32 bg) {
     UINT64 conventional_pages = 0;
     UINT64 loader_pages = 0;
     UINT64 boot_pages = 0;
@@ -1232,6 +1630,11 @@ static void draw_memory_map(framebuffer_t *fb, efi_memory_map_t *map, paging_inf
         append_dec64(p, paging->mapped_ranges);
         draw_line(fb, 48, &y, line, fg, bg, 2);
 
+        y += 8;
+    }
+
+    if (acpi) {
+        draw_acpi_info(fb, &y, acpi, fg, accent, warn, bg);
         y += 8;
     }
 
@@ -1477,6 +1880,8 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE image, EFI_SYSTEM_TABLE *st) {
     fb.size = gop->Mode->FrameBufferSize;
     fb.format = gop->Mode->Info->PixelFormat;
 
+    UINT64 acpi_rsdp = find_acpi_rsdp(st);
+
     efi_memory_map_t memory_map;
     memory_map.descriptors = 0;
     memory_map.map_size = 0;
@@ -1518,8 +1923,11 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE image, EFI_SYSTEM_TABLE *st) {
     }
 
     paging.idt_self_test_ok = run_idt_self_test() ? 1U : 0U;
+    acpi_info_t acpi;
+    parse_acpi(acpi_rsdp, &memory_map, &acpi);
+
     clear_screen(&fb, bg);
-    draw_memory_map(&fb, &memory_map, &paging, fg, muted, accent, warn, bg);
+    draw_memory_map(&fb, &memory_map, &paging, &acpi, fg, muted, accent, warn, bg);
     run_fault_test_if_enabled();
 
     halt_forever();
