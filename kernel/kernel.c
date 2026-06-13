@@ -8,6 +8,14 @@ typedef struct {
     EFI_GRAPHICS_PIXEL_FORMAT format;
 } framebuffer_t;
 
+typedef struct {
+    EFI_MEMORY_DESCRIPTOR *descriptors;
+    UINTN map_size;
+    UINTN descriptor_size;
+    UINT32 descriptor_version;
+    UINTN descriptor_count;
+} efi_memory_map_t;
+
 static UINT32 color(framebuffer_t *fb, UINT8 r, UINT8 g, UINT8 b) {
     if (fb->format == PixelRedGreenBlueReserved8BitPerColor) {
         return ((UINT32)b << 16) | ((UINT32)g << 8) | r;
@@ -241,6 +249,56 @@ static char *append_dec(char *p, UINT32 value) {
     return p;
 }
 
+static char *append_dec64(char *p, UINT64 value) {
+    char tmp[20];
+    UINT32 n = 0;
+    if (value == 0) {
+        *p++ = '0';
+        *p = 0;
+        return p;
+    }
+    while (value > 0) {
+        tmp[n++] = (char)('0' + (value % 10));
+        value /= 10;
+    }
+    while (n > 0) {
+        *p++ = tmp[--n];
+    }
+    *p = 0;
+    return p;
+}
+
+static char *append_spaces(char *p, UINT32 count) {
+    while (count-- > 0) {
+        *p++ = ' ';
+    }
+    *p = 0;
+    return p;
+}
+
+static char *append_left(char *p, const char *s, UINT32 width) {
+    UINT32 n = 0;
+    while (*s && n < width) {
+        *p++ = *s++;
+        n++;
+    }
+    while (n++ < width) {
+        *p++ = ' ';
+    }
+    *p = 0;
+    return p;
+}
+
+static char *append_dec64_width(char *p, UINT64 value, UINT32 width) {
+    char tmp[21];
+    char *end = append_dec64(tmp, value);
+    UINT32 n = (UINT32)(end - tmp);
+    if (n < width) {
+        p = append_spaces(p, width - n);
+    }
+    return append_str(p, tmp);
+}
+
 static char *append_hex64(char *p, UINT64 value) {
     static const char digits[] = "0123456789ABCDEF";
     p = append_str(p, "0X");
@@ -251,6 +309,38 @@ static char *append_hex64(char *p, UINT64 value) {
     return p;
 }
 
+static char *append_hex64_width(char *p, UINT64 value, UINT32 width) {
+    char tmp[19];
+    append_hex64(tmp, value);
+    if (width > 18) {
+        p = append_spaces(p, width - 18);
+    }
+    return append_str(p, tmp);
+}
+
+static const char *memory_type_name(UINT32 type) {
+    switch (type) {
+    case EfiReservedMemoryType: return "RSV";
+    case EfiLoaderCode: return "LOAD-CODE";
+    case EfiLoaderData: return "LOAD-DATA";
+    case EfiBootServicesCode: return "BS-CODE";
+    case EfiBootServicesData: return "BS-DATA";
+    case EfiRuntimeServicesCode: return "RT-CODE";
+    case EfiRuntimeServicesData: return "RT-DATA";
+    case EfiConventionalMemory: return "CONV";
+    case EfiUnusableMemory: return "UNUSABLE";
+    case EfiACPIReclaimMemory: return "ACPI-R";
+    case EfiACPIMemoryNVS: return "ACPI-NVS";
+    case EfiMemoryMappedIO: return "MMIO";
+    case EfiMemoryMappedIOPortSpace: return "MMIO-PORT";
+    case EfiPalCode: return "PAL";
+    case EfiPersistentMemory: return "PERSIST";
+    case EfiUnacceptedMemoryType: return "UNACCEPT";
+    default: return "UNKNOWN";
+    }
+}
+
+static char *append_feature(char *p, int enabled, int *first, const char *name) __attribute__((unused));
 static char *append_feature(char *p, int enabled, int *first, const char *name) {
     if (!enabled) {
         return p;
@@ -262,6 +352,7 @@ static char *append_feature(char *p, int enabled, int *first, const char *name) 
     return append_str(p, name);
 }
 
+static void collect_cpu_info(cpu_info_t *cpu) __attribute__((unused));
 static void collect_cpu_info(cpu_info_t *cpu) {
     UINT32 a = 0;
     UINT32 b = 0;
@@ -334,10 +425,15 @@ static void collect_cpu_info(cpu_info_t *cpu) {
     }
 }
 
+static void make_cpu_line(char *line, const char *label, UINT32 value) __attribute__((unused));
 static void make_cpu_line(char *line, const char *label, UINT32 value) {
     char *p = line;
     p = append_str(p, label);
     p = append_dec(p, value);
+}
+
+static EFI_MEMORY_DESCRIPTOR *memory_desc_at(efi_memory_map_t *map, UINTN index) {
+    return (EFI_MEMORY_DESCRIPTOR *)((UINT8 *)map->descriptors + index * map->descriptor_size);
 }
 
 static UINT16 read_cs(void) {
@@ -418,13 +514,230 @@ static int run_idt_self_test(void) {
     return interrupt_trace.vector == 3 && interrupt_trace.count == 1;
 }
 
+static int draw_map_line(framebuffer_t *fb, UINT32 *y, const char *s, UINT32 fg, UINT32 bg) {
+    if (*y + 20 > fb->height) {
+        return 0;
+    }
+    draw_line(fb, 48, y, s, fg, bg, 2);
+    return 1;
+}
+
+static UINT32 memory_line_color(EFI_MEMORY_DESCRIPTOR *desc, UINT32 fg, UINT32 muted, UINT32 accent, UINT32 warn) {
+    switch (desc->Type) {
+    case EfiConventionalMemory:
+        return fg;
+    case EfiMemoryMappedIO:
+    case EfiMemoryMappedIOPortSpace:
+        return warn;
+    case EfiReservedMemoryType:
+    case EfiUnusableMemory:
+        return accent;
+    default:
+        return muted;
+    }
+}
+
+static void draw_memory_map(framebuffer_t *fb, efi_memory_map_t *map, UINT32 fg, UINT32 muted, UINT32 accent,
+                            UINT32 warn, UINT32 bg) {
+    UINT64 conventional_pages = 0;
+    UINT64 loader_pages = 0;
+    UINT64 boot_pages = 0;
+    UINT64 runtime_pages = 0;
+    UINT64 acpi_pages = 0;
+    UINT64 mmio_pages = 0;
+    UINT64 reserved_pages = 0;
+    UINT64 total_pages = 0;
+    UINT64 max_end = 0;
+    char line[192];
+    char *p;
+    const UINT32 table_scale = 2;
+
+    for (UINTN i = 0; i < map->descriptor_count; i++) {
+        EFI_MEMORY_DESCRIPTOR *desc = memory_desc_at(map, i);
+        UINT64 pages = desc->NumberOfPages;
+        UINT64 end = desc->PhysicalStart + (pages << 12);
+        total_pages += pages;
+        if (end > max_end) {
+            max_end = end;
+        }
+
+        switch (desc->Type) {
+        case EfiConventionalMemory:
+            conventional_pages += pages;
+            break;
+        case EfiLoaderCode:
+        case EfiLoaderData:
+            loader_pages += pages;
+            break;
+        case EfiBootServicesCode:
+        case EfiBootServicesData:
+            boot_pages += pages;
+            break;
+        case EfiRuntimeServicesCode:
+        case EfiRuntimeServicesData:
+            runtime_pages += pages;
+            break;
+        case EfiACPIReclaimMemory:
+        case EfiACPIMemoryNVS:
+            acpi_pages += pages;
+            break;
+        case EfiMemoryMappedIO:
+        case EfiMemoryMappedIOPortSpace:
+            mmio_pages += pages;
+            break;
+        default:
+            reserved_pages += pages;
+            break;
+        }
+    }
+
+    UINT32 y = 42;
+    draw_text(fb, 48, y, "UEFI MEMORY MAP", fg, bg, 4);
+    y += 58;
+
+    p = append_str(line, "DESCRIPTORS: ");
+    p = append_dec64(p, map->descriptor_count);
+    p = append_str(p, "  DESC SIZE: ");
+    p = append_dec64(p, map->descriptor_size);
+    p = append_str(p, "  VERSION: ");
+    append_dec(p, map->descriptor_version);
+    draw_line(fb, 48, &y, line, accent, bg, 2);
+
+    p = append_str(line, "TOTAL PAGES: ");
+    p = append_dec64(p, total_pages);
+    p = append_str(p, "  MAX END: ");
+    append_hex64(p, max_end);
+    draw_line(fb, 48, &y, line, muted, bg, 2);
+
+    p = append_str(line, "CONV: ");
+    p = append_dec64(p, conventional_pages);
+    p = append_str(p, " PGS (");
+    p = append_dec64(p, conventional_pages / 256);
+    p = append_str(p, " MIB)  BOOT: ");
+    p = append_dec64(p, boot_pages);
+    p = append_str(p, "  LOADER: ");
+    append_dec64(p, loader_pages);
+    draw_line(fb, 48, &y, line, fg, bg, 2);
+
+    p = append_str(line, "RUNTIME: ");
+    p = append_dec64(p, runtime_pages);
+    p = append_str(p, "  ACPI: ");
+    p = append_dec64(p, acpi_pages);
+    p = append_str(p, "  MMIO: ");
+    p = append_dec64(p, mmio_pages);
+    p = append_str(p, "  RESERVED-OTHER: ");
+    append_dec64(p, reserved_pages);
+    draw_line(fb, 48, &y, line, fg, bg, 2);
+
+    y += 8;
+    p = append_left(line, "IDX", 3);
+    *p++ = ' ';
+    *p = 0;
+    p = append_left(p, "TYPE", 10);
+    *p++ = ' ';
+    *p = 0;
+    p = append_left(p, "START", 18);
+    *p++ = ' ';
+    *p = 0;
+    p = append_left(p, "END", 18);
+    *p++ = ' ';
+    *p = 0;
+    p = append_left(p, "PAGES", 8);
+    *p++ = ' ';
+    *p = 0;
+    append_left(p, "ATTR", 18);
+    draw_line(fb, 48, &y, line, accent, bg, table_scale);
+
+    UINTN output_count = map->descriptor_count;
+    if (output_count > 512) {
+        output_count = 512;
+        draw_line(fb, 48, &y, "OUTPUT TRUNCATED TO 512 DESCRIPTORS", warn, bg, table_scale);
+    }
+
+    UINT8 emitted[512];
+    for (UINTN i = 0; i < output_count; i++) {
+        emitted[i] = 0;
+    }
+
+    UINT64 cursor = 0;
+
+    for (UINTN printed = 0; printed < output_count; printed++) {
+        UINTN best_index = output_count;
+        UINT64 best_start = ~(UINT64)0;
+        for (UINTN i = 0; i < output_count; i++) {
+            EFI_MEMORY_DESCRIPTOR *candidate = memory_desc_at(map, i);
+            if (!emitted[i] && (candidate->PhysicalStart < best_start || best_index == output_count)) {
+                best_index = i;
+                best_start = candidate->PhysicalStart;
+            }
+        }
+        if (best_index == output_count) {
+            return;
+        }
+        emitted[best_index] = 1;
+
+        EFI_MEMORY_DESCRIPTOR *desc = memory_desc_at(map, best_index);
+        UINT64 start = desc->PhysicalStart;
+        UINT64 bytes = desc->NumberOfPages << 12;
+        UINT64 end_exclusive = start + bytes;
+        UINT64 end_inclusive = end_exclusive == 0 ? 0 : end_exclusive - 1;
+
+        if (start > cursor) {
+            UINT64 hole_pages = (start - cursor) >> 12;
+            p = append_left(line, "---", 3);
+            *p++ = ' ';
+            *p = 0;
+            p = append_left(p, "HOLE", 10);
+            *p++ = ' ';
+            *p = 0;
+            p = append_hex64_width(p, cursor, 18);
+            *p++ = ' ';
+            *p = 0;
+            p = append_hex64_width(p, start - 1, 18);
+            *p++ = ' ';
+            *p = 0;
+            p = append_dec64_width(p, hole_pages, 8);
+            *p++ = ' ';
+            *p = 0;
+            append_left(p, "", 18);
+            if (!draw_map_line(fb, &y, line, warn, bg)) {
+                return;
+            }
+        }
+
+        p = append_dec64_width(line, best_index, 3);
+        *p++ = ' ';
+        *p = 0;
+        p = append_left(p, memory_type_name(desc->Type), 10);
+        *p++ = ' ';
+        *p = 0;
+        p = append_hex64_width(p, start, 18);
+        *p++ = ' ';
+        *p = 0;
+        p = append_hex64_width(p, end_inclusive, 18);
+        *p++ = ' ';
+        *p = 0;
+        p = append_dec64_width(p, desc->NumberOfPages, 8);
+        *p++ = ' ';
+        *p = 0;
+        append_hex64_width(p, desc->Attribute, 18);
+        if (!draw_map_line(fb, &y, line, memory_line_color(desc, fg, muted, accent, warn), bg)) {
+            return;
+        }
+
+        if (end_exclusive > cursor) {
+            cursor = end_exclusive;
+        }
+    }
+}
+
 static void halt_forever(void) {
     for (;;) {
         __asm__ __volatile__("cli; hlt");
     }
 }
 
-static EFI_STATUS exit_boot_services(EFI_HANDLE image, EFI_BOOT_SERVICES *bs) {
+static EFI_STATUS exit_boot_services(EFI_HANDLE image, EFI_BOOT_SERVICES *bs, efi_memory_map_t *out_map) {
     EFI_STATUS status;
     UINTN map_size = 0;
     UINTN map_key = 0;
@@ -455,6 +768,11 @@ static EFI_STATUS exit_boot_services(EFI_HANDLE image, EFI_BOOT_SERVICES *bs) {
 
         status = bs->ExitBootServices(image, map_key);
         if (status == EFI_SUCCESS) {
+            out_map->descriptors = map;
+            out_map->map_size = this_map_size;
+            out_map->descriptor_size = desc_size;
+            out_map->descriptor_version = desc_version;
+            out_map->descriptor_count = this_map_size / desc_size;
             return EFI_SUCCESS;
         }
     }
@@ -493,7 +811,14 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE image, EFI_SYSTEM_TABLE *st) {
     fb.stride = gop->Mode->Info->PixelsPerScanLine;
     fb.format = gop->Mode->Info->PixelFormat;
 
-    status = exit_boot_services(image, bs);
+    efi_memory_map_t memory_map;
+    memory_map.descriptors = 0;
+    memory_map.map_size = 0;
+    memory_map.descriptor_size = 0;
+    memory_map.descriptor_version = 0;
+    memory_map.descriptor_count = 0;
+
+    status = exit_boot_services(image, bs, &memory_map);
     if (status != EFI_SUCCESS) {
         if (st->ConOut) {
             st->ConOut->OutputString(st->ConOut, L"ExitBootServices failed\r\n");
@@ -505,99 +830,13 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE image, EFI_SYSTEM_TABLE *st) {
     UINT32 fg = color(&fb, 0xf2, 0xf2, 0xf2);
     UINT32 accent = color(&fb, 0x5c, 0xd6, 0x91);
     UINT32 muted = color(&fb, 0xa8, 0xb0, 0xb8);
-    UINT32 scale = 5;
-    UINT32 info_scale = 3;
-    cpu_info_t cpu;
-    char line[160];
-    char *p;
-    int first;
-    int idt_ok;
+    UINT32 warn = color(&fb, 0xff, 0xc8, 0x5c);
 
     install_gdt();
     install_idt();
-    idt_ok = run_idt_self_test();
-
-    collect_cpu_info(&cpu);
+    run_idt_self_test();
     clear_screen(&fb, bg);
-    draw_text(&fb, 48, 48, "hello from bare kernel", fg, bg, scale);
-    draw_text(&fb, 48, 112, "pxe ok", accent, bg, scale);
-
-    UINT32 y = 190;
-    draw_line(&fb, 48, &y, "MODE NOW: X86-64 LONG MODE", accent, bg, info_scale);
-    draw_line(&fb, 48, &y, "ARCHITECTURE: X86_64", fg, bg, info_scale);
-    draw_line(&fb, 48, &y, "CPU OP-MODES: 32-BIT 64-BIT", fg, bg, info_scale);
-    draw_line(&fb, 48, &y, "BYTE ORDER: LITTLE ENDIAN", fg, bg, info_scale);
-    draw_line(&fb, 48, &y, "GDT: INSTALLED", accent, bg, info_scale);
-    draw_line(&fb, 48, &y, "IDT: INSTALLED", accent, bg, info_scale);
-    draw_line(&fb, 48, &y, idt_ok ? "IDT SELF-TEST: BP HANDLED" : "IDT SELF-TEST: FAILED", accent, bg, info_scale);
-    draw_line(&fb, 48, &y, idt_ok ? "AFTER INT3: YES" : "AFTER INT3: NO", accent, bg, info_scale);
-
-    p = append_str(line, "IDT VECTOR: ");
-    p = append_dec(p, interrupt_trace.vector);
-    p = append_str(p, "  COUNT: ");
-    append_dec(p, interrupt_trace.count);
-    draw_line(&fb, 48, &y, line, muted, bg, info_scale);
-
-    p = append_str(line, "INT3 RIP: ");
-    append_hex64(p, interrupt_trace.rip);
-    draw_line(&fb, 48, &y, line, muted, bg, info_scale);
-
-    p = append_str(line, "INT3 CS: ");
-    p = append_hex64(p, interrupt_trace.cs);
-    p = append_str(p, "  RFLAGS: ");
-    append_hex64(p, interrupt_trace.rflags);
-    draw_line(&fb, 48, &y, line, muted, bg, info_scale);
-
-    p = append_str(line, "VENDOR ID: ");
-    append_str(p, cpu.vendor);
-    draw_line(&fb, 48, &y, line, fg, bg, info_scale);
-
-    p = append_str(line, "MODEL NAME: ");
-    append_str(p, cpu.brand);
-    draw_line(&fb, 48, &y, line, fg, bg, info_scale);
-
-    make_cpu_line(line, "CPU FAMILY: ", cpu.family);
-    draw_line(&fb, 48, &y, line, muted, bg, info_scale);
-    make_cpu_line(line, "MODEL: ", cpu.model);
-    draw_line(&fb, 48, &y, line, muted, bg, info_scale);
-    make_cpu_line(line, "STEPPING: ", cpu.stepping);
-    draw_line(&fb, 48, &y, line, muted, bg, info_scale);
-
-    p = append_str(line, "LOGICAL CPU(S): ");
-    p = append_dec(p, cpu.logical_processors);
-    p = append_str(p, "  CORE(S) PER PACKAGE: ");
-    append_dec(p, cpu.cores_per_package);
-    draw_line(&fb, 48, &y, line, muted, bg, info_scale);
-
-    p = append_str(line, "ADDRESS SIZES: ");
-    p = append_dec(p, cpu.physical_address_bits);
-    p = append_str(p, " BITS PHYSICAL, ");
-    p = append_dec(p, cpu.virtual_address_bits);
-    append_str(p, " BITS VIRTUAL");
-    draw_line(&fb, 48, &y, line, muted, bg, info_scale);
-
-    p = append_str(line, "FLAGS: ");
-    first = 1;
-    p = append_feature(p, (cpu.ext_edx & (1U << 29)) != 0, &first, "LM");
-    p = append_feature(p, (cpu.leaf1_edx & (1U << 9)) != 0, &first, "APIC");
-    p = append_feature(p, (cpu.leaf1_edx & (1U << 28)) != 0, &first, "HTT");
-    p = append_feature(p, (cpu.leaf1_edx & (1U << 23)) != 0, &first, "MMX");
-    p = append_feature(p, (cpu.leaf1_edx & (1U << 25)) != 0, &first, "SSE");
-    p = append_feature(p, (cpu.leaf1_edx & (1U << 26)) != 0, &first, "SSE2");
-    p = append_feature(p, (cpu.leaf1_ecx & (1U << 0)) != 0, &first, "SSE3");
-    p = append_feature(p, (cpu.leaf1_ecx & (1U << 9)) != 0, &first, "SSSE3");
-    p = append_feature(p, (cpu.leaf1_ecx & (1U << 19)) != 0, &first, "SSE4_1");
-    p = append_feature(p, (cpu.leaf1_ecx & (1U << 20)) != 0, &first, "SSE4_2");
-    p = append_feature(p, (cpu.leaf1_ecx & (1U << 21)) != 0, &first, "X2APIC");
-    p = append_feature(p, (cpu.leaf1_ecx & (1U << 25)) != 0, &first, "AES");
-    p = append_feature(p, (cpu.leaf1_ecx & (1U << 28)) != 0, &first, "AVX");
-    p = append_feature(p, (cpu.leaf7_ebx & (1U << 5)) != 0, &first, "AVX2");
-    p = append_feature(p, (cpu.leaf7_ebx & (1U << 7)) != 0, &first, "SMEP");
-    p = append_feature(p, (cpu.leaf7_ebx & (1U << 20)) != 0, &first, "SMAP");
-    if (first) {
-        append_str(p, "NONE");
-    }
-    draw_line(&fb, 48, &y, line, muted, bg, info_scale);
+    draw_memory_map(&fb, &memory_map, fg, muted, accent, warn, bg);
 
     halt_forever();
     return EFI_SUCCESS;
