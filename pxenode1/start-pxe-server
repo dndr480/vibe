@@ -2,6 +2,7 @@
 set -euo pipefail
 
 script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+repo_dir="$(cd -- "$script_dir/.." && pwd)"
 pxe_dir="$script_dir/pxe"
 run_dir="$pxe_dir/run"
 tftp_dir="$pxe_dir/tftp"
@@ -35,7 +36,7 @@ case "${1:-}" in
 esac
 
 case "$profile" in
-  ssh|hello) ;;
+  ssh|hello|kernel) ;;
   *)
     printf 'error: unsupported PXE profile: %s\n' "$profile" >&2
     exit 1
@@ -113,6 +114,18 @@ set base http://${server_ip}:${http_port}
 chain \${base}/hello.efi || goto failed
 :failed
 echo PXE hello failed
+shell
+EOF
+      ;;
+    kernel)
+      cat > "$www_dir/boot.ipxe" <<EOF
+#!ipxe
+echo pxenode1 PXE bare kernel via ${server_ip}:${http_port}
+dhcp || goto failed
+set base http://${server_ip}:${http_port}
+chain \${base}/kernel/kernel.efi || goto failed
+:failed
+echo PXE bare kernel failed
 shell
 EOF
       ;;
@@ -217,6 +230,8 @@ EOF
 
 if [[ "$profile" == "hello" ]]; then
   "$script_dir/build-hello-efi"
+elif [[ "$profile" == "kernel" ]]; then
+  "$repo_dir/kernel/build-kernel-efi" "$www_dir/kernel/kernel.efi"
 else
   make_apkovl
 fi

@@ -1,0 +1,38 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+repo_dir="$(cd -- "$script_dir/.." && pwd)"
+build_dir="$script_dir/build"
+out="${1:-$repo_dir/pxenode1/pxe/www/kernel/kernel.efi}"
+
+mkdir -p "$build_dir" "$(dirname -- "$out")"
+
+gcc \
+  -std=c11 \
+  -Wall \
+  -Wextra \
+  -ffreestanding \
+  -fshort-wchar \
+  -fno-stack-protector \
+  -fno-stack-check \
+  -fno-asynchronous-unwind-tables \
+  -fno-ident \
+  -fpic \
+  -mno-red-zone \
+  -maccumulate-outgoing-args \
+  -c "$script_dir/kernel.c" \
+  -o "$build_dir/kernel.o"
+
+ld \
+  -mi386pep \
+  --subsystem 10 \
+  -dll \
+  -nostdlib \
+  -e efi_main \
+  "$build_dir/kernel.o" \
+  -o "$build_dir/kernel.efi"
+
+strip "$build_dir/kernel.efi"
+install -m 0644 "$build_dir/kernel.efi" "$out"
+file "$out"

@@ -2,6 +2,7 @@ tftp/*
 www/alpine/*
 www/boot.ipxe
 www/hello.efi
+www/kernel/
 www/pxenode1.apkovl.tar.gz
 run/*
 assets.env

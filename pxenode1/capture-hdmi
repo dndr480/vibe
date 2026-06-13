@@ -1,0 +1,153 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+default_device="/dev/v4l/by-id/usb-Elgato_Cam_Link_4K_0004E8172A000-video-index0"
+device="${PXENODE1_CAPTURE_DEVICE:-auto}"
+size="${PXENODE1_CAPTURE_SIZE:-1920x1080}"
+input_format="${PXENODE1_CAPTURE_FORMAT:-yuyv422}"
+fps="${PXENODE1_CAPTURE_FPS:-auto}"
+output=""
+list_only=0
+
+find_obs_virtual_camera() {
+  for name in /sys/class/video4linux/video*/name; do
+    [[ -r "$name" ]] || continue
+    if grep -qx 'OBS Virtual Camera' "$name"; then
+      printf '/dev/%s\n' "$(basename "$(dirname "$name")")"
+      return 0
+    fi
+  done
+  return 1
+}
+
+resolve_device() {
+  case "$device" in
+    auto)
+      find_obs_virtual_camera || printf '%s\n' "$default_device"
+      ;;
+    obs|obs-virtual|virtual)
+      find_obs_virtual_camera || true
+      ;;
+    *)
+      printf '%s\n' "$device"
+      ;;
+  esac
+}
+
+usage() {
+  cat <<EOF
+Usage: $0 [--output PATH] [--device DEV] [--size WxH] [--format FORMAT] [--fps N] [--list]
+
+Capture one still frame from the HDMI capture card.
+
+Defaults:
+  device: auto, prefers OBS Virtual Camera when available, else $default_device
+  size:   1920x1080
+  format: yuyv422
+  fps:    auto, 30 for OBS Virtual Camera, 60 for Cam Link
+EOF
+}
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --output|-o)
+      output="${2:-}"
+      shift 2
+      ;;
+    --device|-d)
+      device="${2:-}"
+      shift 2
+      ;;
+    --size|-s)
+      size="${2:-}"
+      shift 2
+      ;;
+    --format|-f)
+      input_format="${2:-}"
+      shift 2
+      ;;
+    --fps)
+      fps="${2:-}"
+      shift 2
+      ;;
+    --list)
+      list_only=1
+      shift
+      ;;
+    --help|-h)
+      usage
+      exit 0
+      ;;
+    *)
+      printf 'error: unknown argument: %s\n' "$1" >&2
+      usage >&2
+      exit 2
+      ;;
+  esac
+done
+
+device="$(resolve_device)"
+if [[ -z "$device" ]]; then
+  printf 'error: could not find requested capture device\n' >&2
+  exit 1
+fi
+if [[ "$list_only" -eq 1 ]]; then
+  v4l2-ctl --list-devices
+  printf '\nSelected device: %s\n\n' "$device"
+  v4l2-ctl -d "$device" --list-formats-ext
+  exit 0
+fi
+if [[ "$fps" == "auto" ]]; then
+  if [[ -r "/sys/class/video4linux/$(basename "$device")/name" ]] &&
+    grep -qx 'OBS Virtual Camera' "/sys/class/video4linux/$(basename "$device")/name"; then
+    fps=30
+  else
+    fps=60
+  fi
+fi
+
+if [[ -z "$output" ]]; then
+  mkdir -p "$script_dir/captures"
+  output="$script_dir/captures/pxenode1-screen-$(date +%Y%m%d-%H%M%S).jpg"
+else
+  mkdir -p "$(dirname -- "$output")"
+fi
+
+if [[ ! -e "$device" ]]; then
+  printf 'error: capture device not found: %s\n' "$device" >&2
+  exit 1
+fi
+
+if ! command -v ffmpeg >/dev/null; then
+  printf 'error: ffmpeg is not installed\n' >&2
+  exit 1
+fi
+
+log="$(mktemp)"
+trap 'rm -f "$log"' EXIT
+
+if timeout 12s ffmpeg \
+  -hide_banner \
+  -loglevel info \
+  -f v4l2 \
+  -framerate "$fps" \
+  -video_size "$size" \
+  -input_format "$input_format" \
+  -i "$device" \
+  -frames:v 1 \
+  -q:v 2 \
+  -y "$output" >"$log" 2>&1; then
+  file "$output"
+  printf '%s\n' "$output"
+else
+  status=$?
+  printf 'error: capture failed from %s\n' "$device" >&2
+  sed -n '1,120p' "$log" >&2
+  if grep -qi 'Device or resource busy' "$log"; then
+    printf '\nThe capture device is busy. Current users:\n' >&2
+    fuser -v "$device" 2>&1 >&2 || true
+    printf '\nOBS is likely holding /dev/video0 exclusively. Disable the OBS V4L2 source or stop OBS, then retry.\n' >&2
+  fi
+  exit "$status"
+fi

@@ -1,0 +1,7 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+repo_dir="$(cd -- "$script_dir/.." && pwd)"
+
+PXENODE1_PXE_PROFILE=kernel exec "$repo_dir/pxenode1/start-pxe-server" "$@"

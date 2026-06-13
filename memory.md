@@ -1,5 +1,9 @@
 # Project Memory
 
+## Workflow
+
+- When the user asks to commit changes, commit and then immediately run `git push`.
+
 ## pxenode1 AMT
 
 - Target: `pxenode1`
@@ -85,7 +89,23 @@ To run one command over SSH:
 ~/vibe/pxenode1/ssh-pxe 'uname -a; cat /etc/alpine-release; rc-service sshd status'
 ```
 
-The `ssh-pxe` script uses a temporary known-hosts file at `/tmp/pxenode1-pxe-known-hosts`, because this diskless boot can regenerate host keys.
+The `ssh-pxe` script uses `/dev/null` for known-hosts by default, because this diskless boot can regenerate host keys on every boot.
+
+Serial ports observed from the Alpine PXE image:
+
+```text
+ttyS0 / COM1: I/O 0x3f8, IRQ 4, 16550A
+ttyS1:        I/O 0xf0a0, IRQ 20, 16550A, Intel 200 Series/Z370 KT Redirection
+```
+
+`/proc/tty/driver/serial` showed:
+
+```text
+0: uart:16550A port:000003F8 irq:4
+1: uart:16550A port:0000F0A0 irq:20
+```
+
+DMI did not list an external serial connector, so COM1 exists as a legacy UART resource, but a physical DB9/header is not confirmed.
 
 ## Hardware Inspection
 
@@ -163,3 +183,123 @@ This profile does not boot Linux and does not start SSH. To return to the SSH-ca
 ~/vibe/pxenode1/start-pxe-server
 ~/vibe/pxenode1/reset --yes
 ```
+
+## PXE Bare Kernel Framebuffer Test
+
+The bare-kernel experiment lives at the repo top level, not under `pxenode1`:
+
+```bash
+~/vibe/kernel/efi.h
+~/vibe/kernel/kernel.c
+~/vibe/kernel/build-kernel-efi
+~/vibe/kernel/start-pxe-kernel
+```
+
+This is still delivered as a PE/COFF UEFI image so firmware/iPXE can load it, but it exits boot services before drawing:
+
+```text
+iPXE -> kernel/kernel.efi
+efi_main()
+  LocateProtocol(GOP)
+  save framebuffer base/resolution/stride
+  GetMemoryMap()
+  ExitBootServices()
+  clear framebuffer
+  draw bitmap text directly into video memory
+  hlt forever
+```
+
+Build and serve it:
+
+```bash
+~/vibe/kernel/build-kernel-efi
+~/vibe/pxenode1/stop-pxe-server
+~/vibe/kernel/start-pxe-kernel
+~/vibe/pxenode1/reset --yes
+```
+
+Expected screen text:
+
+```text
+hello from bare kernel
+pxe ok
+```
+
+The kernel now also prints CPUID-derived `lscpu`-style basics after the hello lines:
+
+```text
+MODE NOW: X86-64 LONG MODE
+ARCHITECTURE: X86_64
+CPU OP-MODES: 32-BIT 64-BIT
+BYTE ORDER: LITTLE ENDIAN
+VENDOR ID: ...
+MODEL NAME: ...
+CPU FAMILY: ...
+MODEL: ...
+STEPPING: ...
+LOGICAL CPU(S): ...
+CORE(S) PER PACKAGE: ...
+ADDRESS SIZES: ...
+FLAGS: ...
+```
+
+Successful fetch evidence from 2026-06-12:
+
+```text
+GET /boot.ipxe
+GET /kernel/kernel.efi
+```
+
+This profile does not boot Linux and does not start SSH. It is expected to stop in the custom kernel after drawing to the framebuffer. On x86_64 UEFI, `kernel.efi` is entered in 64-bit long mode. The current kernel calls `ExitBootServices()` and continues in that inherited long-mode environment; it does not yet install its own GDT, IDT, page tables, scheduler, or memory manager.
+
+## HDMI Capture Card
+
+The local HDMI capture device is an Elgato Cam Link 4K:
+
+```text
+/dev/v4l/by-id/usb-Elgato_Cam_Link_4K_0004E8172A000-video-index0 -> /dev/video0
+/dev/v4l/by-id/usb-Elgato_Cam_Link_4K_0004E8172A000-video-index1 -> /dev/video1
+```
+
+`/dev/video0` is the actual video stream. `/dev/video1` is UVC metadata, not the screen image.
+
+OBS currently opens `/dev/video0` directly through V4L2. The Cam Link/uvcvideo path is exclusive in this setup: a concurrent `ffmpeg` capture returns `Device or resource busy` while OBS holds the device.
+
+OBS Virtual Camera was enabled and appeared as:
+
+```text
+OBS Virtual Camera -> /dev/video2
+```
+
+OBS was configured with virtual camera type `source`, targeting:
+
+```text
+Video Capture Device (V4L2)
+```
+
+That means `/dev/video2` exposes the clean Cam Link source directly, not the full livestream scene with overlays.
+
+Capture script:
+
+```bash
+~/vibe/pxenode1/capture-hdmi
+```
+
+The script now defaults to `auto`: prefer OBS Virtual Camera when present, otherwise fall back to Cam Link.
+
+It writes screenshots under:
+
+```text
+~/vibe/pxenode1/captures/
+```
+
+Default capture settings:
+
+```text
+device: /dev/v4l/by-id/usb-Elgato_Cam_Link_4K_0004E8172A000-video-index0
+size:   1920x1080
+format: yuyv422
+fps:    60
+```
+
+When OBS Virtual Camera is running, use `capture-hdmi` directly. If it is not running and OBS is still holding `/dev/video0`, disable/stop the OBS V4L2 source before capturing from Cam Link directly.
