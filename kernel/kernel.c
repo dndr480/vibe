@@ -50,6 +50,14 @@ typedef struct {
 #define VIBE_FAULT_TEST_UD2 1
 #define VIBE_FAULT_TEST_PF 2
 
+#define KERNEL_CODE_SELECTOR 0x08
+#define KERNEL_DATA_SELECTOR 0x10
+#define KERNEL_TSS_SELECTOR 0x18
+#define CPU_GDT_ENTRIES 5
+#define CPU_IST_FAULT 1
+#define CPU_IST_DOUBLE_FAULT 2
+#define CPU_FAULT_STACK_SIZE (16 * 1024)
+
 enum {
     PAGING_OK = 0,
     PAGING_ERR_LA57 = 1,
@@ -209,6 +217,27 @@ typedef struct {
 } __attribute__((packed)) descriptor_table_ptr_t;
 
 typedef struct {
+    UINT32 reserved0;
+    UINT64 rsp[3];
+    UINT64 reserved1;
+    UINT64 ist[7];
+    UINT64 reserved2;
+    UINT16 reserved3;
+    UINT16 io_map_base;
+} __attribute__((packed)) tss64_t;
+
+typedef struct {
+    UINT32 id;
+    UINT16 loaded_tr;
+    UINT8 tss_ready;
+    UINT8 reserved;
+    UINT64 gdt[CPU_GDT_ENTRIES];
+    tss64_t tss;
+    UINT8 fault_stack[CPU_FAULT_STACK_SIZE] __attribute__((aligned(16)));
+    UINT8 double_fault_stack[CPU_FAULT_STACK_SIZE] __attribute__((aligned(16)));
+} __attribute__((aligned(16))) cpu_local_t;
+
+typedef struct {
     volatile UINT32 vector;
     volatile UINT32 count;
     volatile UINT64 rip;
@@ -230,11 +259,8 @@ typedef struct {
 } uuid128_t;
 
 static idt_entry_t idt[256];
-static UINT64 gdt[3] __attribute__((aligned(8))) = {
-    0x0000000000000000ULL,
-    0x00af9a000000ffffULL,
-    0x00cf92000000ffffULL,
-};
+static cpu_local_t cpu0;
+static cpu_local_t *current_cpu = &cpu0;
 static interrupt_trace_t interrupt_trace;
 static framebuffer_t kernel_framebuffer;
 static UINT32 kernel_bg;
@@ -569,6 +595,12 @@ static UINT64 read_cr4(void) {
 static UINT64 read_cr2(void) {
     UINT64 value;
     __asm__ __volatile__("mov %%cr2, %0" : "=r"(value));
+    return value;
+}
+
+static UINT16 read_tr(void) {
+    UINT16 value;
+    __asm__ __volatile__("str %0" : "=r"(value));
     return value;
 }
 
@@ -907,6 +939,23 @@ void fault_dispatch(fault_frame_t *frame) {
     append_hex64(p, read_cr3());
     draw_line(fb, 48, &y, line, kernel_fg, kernel_bg, 2);
 
+    cpu_local_t *cpu = current_cpu;
+    p = append_str(line, "CPU: ");
+    p = append_dec(p, cpu ? cpu->id : 0);
+    p = append_str(p, "  TR: ");
+    p = append_hex64(p, read_tr());
+    p = append_str(p, "  LOADED TR: ");
+    p = append_hex64(p, cpu ? cpu->loaded_tr : 0);
+    p = append_str(p, "  TSS: ");
+    append_str(p, cpu && cpu->tss_ready ? "READY" : "NOT-READY");
+    draw_line(fb, 48, &y, line, kernel_fg, kernel_bg, 2);
+
+    p = append_str(line, "IST1: ");
+    p = append_hex64(p, cpu ? cpu->tss.ist[CPU_IST_FAULT - 1] : 0);
+    p = append_str(p, "  IST2: ");
+    append_hex64(p, cpu ? cpu->tss.ist[CPU_IST_DOUBLE_FAULT - 1] : 0);
+    draw_line(fb, 48, &y, line, kernel_fg, kernel_bg, 2);
+
     p = append_str(line, "CURRENT REQUEST: ");
     append_uuid128(p, current_request_uuid);
     draw_line(fb, 48, &y, line, kernel_accent, kernel_bg, 2);
@@ -924,10 +973,50 @@ static UINT16 read_cs(void) {
     return cs;
 }
 
-static void install_gdt(void) {
+static void zero_memory(void *ptr, UINTN size) {
+    UINT8 *p = (UINT8 *)ptr;
+    for (UINTN i = 0; i < size; i++) {
+        p[i] = 0;
+    }
+}
+
+static void set_tss_descriptor(UINT64 *gdt, UINT32 index, UINT64 base, UINT32 limit) {
+    UINT64 low = 0;
+
+    low |= (UINT64)(limit & 0xffff);
+    low |= (base & 0x00ffffffULL) << 16;
+    low |= 0x89ULL << 40;
+    low |= ((UINT64)((limit >> 16) & 0x0f)) << 48;
+    low |= ((base >> 24) & 0xffULL) << 56;
+
+    gdt[index] = low;
+    gdt[index + 1] = (base >> 32) & 0xffffffffULL;
+}
+
+static void init_cpu_local(cpu_local_t *cpu, UINT32 id) {
+    zero_memory(cpu, sizeof(*cpu));
+
+    cpu->id = id;
+    cpu->gdt[0] = 0x0000000000000000ULL;
+    cpu->gdt[1] = 0x00af9a000000ffffULL;
+    cpu->gdt[2] = 0x00cf92000000ffffULL;
+    cpu->tss.ist[CPU_IST_FAULT - 1] =
+        (UINT64)(UINTN)(cpu->fault_stack + sizeof(cpu->fault_stack));
+    cpu->tss.ist[CPU_IST_DOUBLE_FAULT - 1] =
+        (UINT64)(UINTN)(cpu->double_fault_stack + sizeof(cpu->double_fault_stack));
+    cpu->tss.io_map_base = sizeof(cpu->tss);
+    set_tss_descriptor(cpu->gdt, KERNEL_TSS_SELECTOR / 8, (UINT64)(UINTN)&cpu->tss,
+                       (UINT32)(sizeof(cpu->tss) - 1));
+    cpu->tss_ready = 1;
+}
+
+static void install_cpu_tables(cpu_local_t *cpu) {
     descriptor_table_ptr_t gdtr;
-    gdtr.limit = (UINT16)(sizeof(gdt) - 1);
-    gdtr.base = (UINT64)(UINTN)gdt;
+    UINT16 tss_selector = KERNEL_TSS_SELECTOR;
+
+    current_cpu = cpu;
+    gdtr.limit = (UINT16)(sizeof(cpu->gdt) - 1);
+    gdtr.base = (UINT64)(UINTN)cpu->gdt;
 
     __asm__ __volatile__(
         "cli\n"
@@ -944,6 +1033,9 @@ static void install_gdt(void) {
         :
         : "m"(gdtr)
         : "rax", "memory");
+
+    __asm__ __volatile__("ltr %0" : : "r"(tss_selector) : "memory");
+    cpu->loaded_tr = read_tr();
 }
 
 static UINT64 isr_breakpoint_addr(void) {
@@ -982,10 +1074,10 @@ static UINT64 isr_fault_pf_addr(void) {
     return addr;
 }
 
-static void set_idt_gate(UINT32 vector, UINT64 addr, UINT16 selector, UINT8 type_attr) {
+static void set_idt_gate(UINT32 vector, UINT64 addr, UINT16 selector, UINT8 ist, UINT8 type_attr) {
     idt[vector].offset_low = (UINT16)(addr & 0xffff);
     idt[vector].selector = selector;
-    idt[vector].ist = 0;
+    idt[vector].ist = ist & 0x7;
     idt[vector].type_attr = type_attr;
     idt[vector].offset_mid = (UINT16)((addr >> 16) & 0xffff);
     idt[vector].offset_high = (UINT32)(addr >> 32);
@@ -997,13 +1089,13 @@ static void install_idt(void) {
     UINT64 unhandled_addr = isr_unhandled_addr();
 
     for (UINT32 vector = 0; vector < 256; vector++) {
-        set_idt_gate(vector, unhandled_addr, cs, 0x8e);
+        set_idt_gate(vector, unhandled_addr, cs, 0, 0x8e);
     }
-    set_idt_gate(3, isr_breakpoint_addr(), cs, 0xef);
-    set_idt_gate(6, isr_fault_ud_addr(), cs, 0x8e);
-    set_idt_gate(8, isr_fault_df_addr(), cs, 0x8e);
-    set_idt_gate(13, isr_fault_gp_addr(), cs, 0x8e);
-    set_idt_gate(14, isr_fault_pf_addr(), cs, 0x8e);
+    set_idt_gate(3, isr_breakpoint_addr(), cs, 0, 0xef);
+    set_idt_gate(6, isr_fault_ud_addr(), cs, CPU_IST_FAULT, 0x8e);
+    set_idt_gate(8, isr_fault_df_addr(), cs, CPU_IST_DOUBLE_FAULT, 0x8e);
+    set_idt_gate(13, isr_fault_gp_addr(), cs, CPU_IST_FAULT, 0x8e);
+    set_idt_gate(14, isr_fault_pf_addr(), cs, CPU_IST_FAULT, 0x8e);
 
     descriptor_table_ptr_t idtr;
     idtr.limit = (UINT16)(sizeof(idt) - 1);
@@ -1415,7 +1507,8 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE image, EFI_SYSTEM_TABLE *st) {
     current_request_uuid.high = 0;
     current_request_uuid.low = 0;
 
-    install_gdt();
+    init_cpu_local(&cpu0, 0);
+    install_cpu_tables(&cpu0);
     install_idt();
 
     paging_info_t paging;
