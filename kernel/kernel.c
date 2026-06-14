@@ -157,7 +157,7 @@ typedef struct {
 #endif
 
 #ifndef VIBE_AP_REQUEST_TARGET_INDEX
-#define VIBE_AP_REQUEST_TARGET_INDEX 0
+#define VIBE_AP_REQUEST_TARGET_INDEX AP_REQUEST_TARGET_SCHEDULER
 #endif
 
 #define KERNEL_CODE_SELECTOR 0x08
@@ -172,6 +172,7 @@ typedef struct {
 #define ACPI_MAX_SDT_LENGTH (1024U * 1024U)
 #define ACPI_CPU_LIST_OUTPUT_LIMIT 5
 #define MAX_AP_CONTEXTS 8
+#define AP_REQUEST_TARGET_SCHEDULER 0xffffffffU
 #define AP_BOOT_STACK_SIZE (16 * 1024)
 #define AP_TRAMPOLINE_PAGES 1ULL
 #define AP_TRAMPOLINE_MAX_ADDRESS 0x9F000ULL
@@ -648,6 +649,15 @@ typedef struct {
 } ap_context_t;
 
 typedef struct {
+    ap_context_t *online[MAX_AP_CONTEXTS];
+    UINT32 online_count;
+    UINT32 next_index;
+    UINT32 selected_context_index;
+    UINT32 selected_apic_id;
+    UINT32 explicit_target;
+} ap_scheduler_t;
+
+typedef struct {
     UINT64 vector;
     UINT64 error_code;
     UINT64 rip;
@@ -660,6 +670,7 @@ static bsp_interrupt_observe_t bsp_interrupt_observe;
 static system_interrupt_observe_t system_interrupt_observe;
 static bsp_fault_display_t bsp_fault_display;
 static ap_broadcast_ping_summary_t ap_broadcast_ping_summary;
+static ap_scheduler_t ap_scheduler;
 static ap_context_t ap_contexts[MAX_AP_CONTEXTS];
 static ap_context_t *ap_request_target_context = &ap_contexts[0];
 static ap_interrupt_observe_t *ap_request_interrupts __attribute__((used)) = &ap_contexts[0].interrupts;
@@ -688,12 +699,71 @@ static int ap_context_is_request_target(ap_context_t *ctx) {
     return ctx == ap_request_target_context;
 }
 
-static ap_context_t *select_ap_request_target_context(UINTN context_count) {
-    UINTN target_index = VIBE_AP_REQUEST_TARGET_INDEX;
-    if (context_count == 0 || target_index >= context_count || target_index >= MAX_AP_CONTEXTS) {
+static int ap_context_is_schedulable(ap_context_t *ctx) {
+    ap_boot_info_t *boot = &ctx->boot;
+    return boot->error == AP_BOOT_OK &&
+           boot->online &&
+           boot->ap_state != AP_BOOT_STATE_HALTED &&
+           boot->ap_state != AP_BOOT_STATE_FAULTED;
+}
+
+static void build_online_ap_registry(ap_scheduler_t *scheduler, ap_context_t *contexts,
+                                     UINTN context_count) {
+    UINT32 next_index = scheduler->next_index;
+    for (UINTN i = 0; i < MAX_AP_CONTEXTS; i++) {
+        scheduler->online[i] = 0;
+    }
+    scheduler->online_count = 0;
+    scheduler->selected_apic_id = 0;
+    scheduler->explicit_target = 0;
+    scheduler->next_index = next_index;
+    scheduler->selected_context_index = AP_REQUEST_TARGET_SCHEDULER;
+    if (context_count > MAX_AP_CONTEXTS) {
+        context_count = MAX_AP_CONTEXTS;
+    }
+
+    for (UINTN i = 0; i < context_count; i++) {
+        if (!ap_context_is_schedulable(&contexts[i])) {
+            continue;
+        }
+        scheduler->online[scheduler->online_count++] = &contexts[i];
+    }
+
+    if (scheduler->online_count > 0 && scheduler->next_index >= scheduler->online_count) {
+        scheduler->next_index = 0;
+    }
+}
+
+static ap_context_t *select_ap_request_target_context(ap_scheduler_t *scheduler,
+                                                      ap_context_t *contexts,
+                                                      UINTN context_count) {
+    UINT32 target_index = VIBE_AP_REQUEST_TARGET_INDEX;
+    if (target_index != AP_REQUEST_TARGET_SCHEDULER &&
+        target_index < context_count &&
+        target_index < MAX_AP_CONTEXTS &&
+        ap_context_is_schedulable(&contexts[target_index])) {
+        scheduler->explicit_target = 1;
+        scheduler->selected_context_index = target_index;
+        scheduler->selected_apic_id = contexts[target_index].boot.target_apic_id;
+        return &contexts[target_index];
+    }
+
+    scheduler->explicit_target = 0;
+    if (scheduler->online_count == 0) {
+        scheduler->selected_context_index = 0;
+        scheduler->selected_apic_id = contexts[0].boot.target_apic_id;
         return ap0_context();
     }
-    return &ap_contexts[target_index];
+
+    UINT32 registry_index = scheduler->next_index;
+    if (registry_index >= scheduler->online_count) {
+        registry_index = 0;
+    }
+    ap_context_t *selected = scheduler->online[registry_index];
+    scheduler->next_index = (registry_index + 1U) % scheduler->online_count;
+    scheduler->selected_context_index = ap_context_index(selected);
+    scheduler->selected_apic_id = selected->boot.target_apic_id;
+    return selected;
 }
 
 static int address_in_range(UINT64 addr, UINT64 start, UINT64 size) {
@@ -3772,6 +3842,29 @@ static void draw_ap_context_summary(framebuffer_t *fb, UINT32 *y, ap_context_t *
     draw_line(fb, 48, y, line, color ? color : fg, bg, 2);
 }
 
+static void draw_ap_scheduler_summary(framebuffer_t *fb, UINT32 *y, UINT32 fg,
+                                      UINT32 accent, UINT32 warn, UINT32 bg) {
+    char line[192];
+    char *p = append_str(line, "AP SCHED: ");
+    p = append_str(p, ap_scheduler.explicit_target ? "EXPLICIT" : "RR");
+    p = append_str(p, "  ONLINE: ");
+    p = append_dec(p, ap_scheduler.online_count);
+    p = append_str(p, "  PICK: ");
+    if (ap_scheduler.selected_context_index == AP_REQUEST_TARGET_SCHEDULER) {
+        p = append_str(p, "NONE");
+    } else {
+        p = append_dec(p, ap_scheduler.selected_context_index + 1U);
+        *p++ = '/';
+        *p = 0;
+        p = append_dec(p, ap_scheduler.selected_apic_id);
+    }
+    p = append_str(p, "  NEXT: ");
+    append_dec(p, ap_scheduler.online_count ? ap_scheduler.next_index + 1U : 0U);
+
+    UINT32 color = ap_scheduler.online_count ? accent : warn;
+    draw_line(fb, 48, y, line, color ? color : fg, bg, 2);
+}
+
 static void draw_ap_broadcast_ping_summary(framebuffer_t *fb, UINT32 *y, UINT32 fg,
                                            UINT32 accent, UINT32 warn, UINT32 bg) {
     ap_broadcast_ping_summary_t *summary = &ap_broadcast_ping_summary;
@@ -3909,6 +4002,7 @@ static void draw_memory_map(framebuffer_t *fb, efi_memory_map_t *map, paging_inf
             draw_ap_context_summary(fb, &y, ap_contexts, ap_context_count, target_context,
                                     fg, accent, warn, bg);
         }
+        draw_ap_scheduler_summary(fb, &y, fg, accent, warn, bg);
         draw_ap_broadcast_ping_summary(fb, &y, fg, accent, warn, bg);
         draw_ap_boot_info(fb, &y, &target_context->boot, fg, accent, warn, bg);
         draw_ap_queue_summary(fb, &y, target_context, fg, accent, warn, bg);
@@ -4210,8 +4304,6 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE image, EFI_SYSTEM_TABLE *st) {
     if (ap_context_count > MAX_AP_CONTEXTS) {
         ap_context_count = MAX_AP_CONTEXTS;
     }
-    ap_context_t *request_target = select_ap_request_target_context(ap_context_count);
-    set_ap_request_target_context(request_target);
     system_lapic_base = acpi.local_apic_base;
     zero_memory(&bsp_wait_observe, sizeof(bsp_wait_observe));
     zero_memory(&system_interrupt_observe, sizeof(system_interrupt_observe));
@@ -4222,6 +4314,10 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE image, EFI_SYSTEM_TABLE *st) {
             bring_up_one_ap(&ap_contexts[i], i, &acpi, &memory_map, &paging);
         }
     }
+    build_online_ap_registry(&ap_scheduler, ap_contexts, ap_context_count);
+    ap_context_t *request_target = select_ap_request_target_context(&ap_scheduler, ap_contexts,
+                                                                    ap_context_count);
+    set_ap_request_target_context(request_target);
     run_ap_broadcast_ping(ap_contexts, ap_context_count, request_target);
     const ap_request_plan_t ap_request_plan[] = {
         {VIBE_AP_FIRST_REQUEST_OPCODE, VIBE_AP_FIRST_REQUEST_SERVICE_ID,
