@@ -58,6 +58,13 @@ typedef struct {
 #define VIBE_AP_FAULT_TEST_UD2 1
 #define VIBE_AP_FAULT_TEST_PF 2
 
+#ifndef VIBE_AP_REQUEST_FAULT_TEST
+#define VIBE_AP_REQUEST_FAULT_TEST 0
+#endif
+
+#define VIBE_AP_REQUEST_FAULT_TEST_NONE 0
+#define VIBE_AP_REQUEST_FAULT_TEST_UD2 1
+
 #define KERNEL_CODE_SELECTOR 0x08
 #define KERNEL_DATA_SELECTOR 0x10
 #define KERNEL_TSS_SELECTOR 0x18
@@ -78,6 +85,7 @@ typedef struct {
 #define AP_TRAMPOLINE_GDT_OFFSET 0x190U
 #define AP_TRAMPOLINE_PROT32_SELECTOR 0x18
 #define AP_ONLINE_TIMEOUT_LOOPS 100000000U
+#define AP_REQUEST_TIMEOUT_LOOPS 100000000U
 
 enum {
     PAGING_OK = 0,
@@ -129,6 +137,24 @@ enum {
     AP_ENTRY_STATE_TABLES = 2,
     AP_ENTRY_STATE_HALTED = 3,
     AP_ENTRY_STATE_FAULT = 4,
+    AP_ENTRY_STATE_LOOP = 5,
+    AP_ENTRY_STATE_REQUEST = 6,
+};
+
+enum {
+    AP_REQUEST_STATUS_EMPTY = 0,
+    AP_REQUEST_STATUS_PENDING = 1,
+    AP_REQUEST_STATUS_RUNNING = 2,
+    AP_REQUEST_STATUS_DONE = 3,
+    AP_REQUEST_STATUS_TIMEOUT = 4,
+    AP_REQUEST_STATUS_BAD_OP = 5,
+    AP_REQUEST_STATUS_FAULT = 6,
+    AP_REQUEST_STATUS_SKIPPED = 7,
+};
+
+enum {
+    AP_REQUEST_OP_NONE = 0,
+    AP_REQUEST_OP_PING = 1,
 };
 
 static UINT32 color(framebuffer_t *fb, UINT8 r, UINT8 g, UINT8 b) {
@@ -381,6 +407,21 @@ typedef struct {
 } ap_boot_info_t;
 
 typedef struct {
+    volatile UINT32 status;
+    volatile UINT32 opcode;
+    volatile UINT32 sequence;
+    volatile UINT32 handled_count;
+    volatile UINT32 wait_loops;
+    volatile UINT32 result_code;
+    volatile UINT64 request_id_high;
+    volatile UINT64 request_id_low;
+    volatile UINT64 result_id_high;
+    volatile UINT64 result_id_low;
+    volatile UINT64 result_cs;
+    volatile UINT64 result_tr;
+} ap_request_slot_t;
+
+typedef struct {
     volatile UINT32 vector;
     volatile UINT32 count;
     volatile UINT64 rip;
@@ -414,6 +455,7 @@ static UINT32 kernel_accent;
 static UINT32 kernel_warn;
 static uuid128_t current_request_uuid;
 static ap_boot_info_t ap_boot;
+static ap_request_slot_t ap_request;
 static UINT8 ap_boot_stack[AP_BOOT_STACK_SIZE] __attribute__((aligned(16)));
 
 extern void isr_breakpoint(void);
@@ -1164,6 +1206,8 @@ void ap_fault_dispatch(fault_frame_t *frame) {
     ap_boot.entry_state = AP_ENTRY_STATE_FAULT;
     ap_boot.ap_state = AP_BOOT_STATE_FAULTED;
     __asm__ __volatile__("mfence" : : : "memory");
+    ap_request.status = AP_REQUEST_STATUS_FAULT;
+    __asm__ __volatile__("mfence" : : : "memory");
     ap_boot.online = 1;
 
     for (;;) {
@@ -1387,6 +1431,135 @@ static void run_ap_fault_test_if_enabled(void) {
 #endif
 }
 
+static void reset_ap_request_slot(ap_request_slot_t *slot) {
+    slot->status = AP_REQUEST_STATUS_EMPTY;
+    slot->opcode = AP_REQUEST_OP_NONE;
+    slot->sequence = 0;
+    slot->handled_count = 0;
+    slot->wait_loops = 0;
+    slot->result_code = 0;
+    slot->request_id_high = 0;
+    slot->request_id_low = 0;
+    slot->result_id_high = 0;
+    slot->result_id_low = 0;
+    slot->result_cs = 0;
+    slot->result_tr = 0;
+}
+
+static int cmpxchg_u32(volatile UINT32 *ptr, UINT32 expected, UINT32 desired) {
+    UINT8 success;
+    __asm__ __volatile__(
+        "lock cmpxchgl %3, %1\n"
+        "sete %0"
+        : "=q"(success), "+m"(*ptr), "+a"(expected)
+        : "r"(desired)
+        : "cc", "memory");
+    return success ? 1 : 0;
+}
+
+static int ap_request_status_terminal(UINT32 status) {
+    return status == AP_REQUEST_STATUS_DONE ||
+           status == AP_REQUEST_STATUS_BAD_OP ||
+           status == AP_REQUEST_STATUS_FAULT;
+}
+
+static void complete_ap_request(UINT32 status) {
+    __asm__ __volatile__("mfence" : : : "memory");
+    (void)cmpxchg_u32(&ap_request.status, AP_REQUEST_STATUS_RUNNING, status);
+    __asm__ __volatile__("mfence" : : : "memory");
+}
+
+static void ap_handle_ping_request(ap_request_slot_t *slot) {
+#if VIBE_AP_REQUEST_FAULT_TEST == VIBE_AP_REQUEST_FAULT_TEST_UD2
+    __asm__ __volatile__("ud2" : : : "memory");
+#endif
+    slot->result_id_high = slot->request_id_high;
+    slot->result_id_low = slot->request_id_low;
+    slot->result_cs = read_cs();
+    slot->result_tr = read_tr();
+    slot->handled_count = slot->handled_count + 1U;
+    slot->result_code = 0;
+}
+
+static void ap_halt_after_request(void) __attribute__((noreturn));
+static void ap_halt_after_request(void) {
+    for (;;) {
+        __asm__ __volatile__("cli; hlt" : : : "memory");
+    }
+}
+
+static void ap_request_loop(void) __attribute__((noreturn));
+static void ap_request_loop(void) {
+    ap_boot.ap_state = AP_BOOT_STATE_ONLINE;
+    ap_boot.entry_state = AP_ENTRY_STATE_LOOP;
+    __asm__ __volatile__("mfence" : : : "memory");
+    ap_boot.online = 1;
+
+    for (;;) {
+        if (ap_request.status == AP_REQUEST_STATUS_PENDING) {
+            if (!cmpxchg_u32(&ap_request.status, AP_REQUEST_STATUS_PENDING,
+                             AP_REQUEST_STATUS_RUNNING)) {
+                __asm__ __volatile__("pause" : : : "memory");
+                continue;
+            }
+            ap_boot.entry_state = AP_ENTRY_STATE_REQUEST;
+            __asm__ __volatile__("mfence" : : : "memory");
+
+            if (ap_request.opcode == AP_REQUEST_OP_PING) {
+                ap_handle_ping_request(&ap_request);
+                ap_boot.ap_state = AP_BOOT_STATE_HALTED;
+                ap_boot.entry_state = AP_ENTRY_STATE_HALTED;
+                complete_ap_request(AP_REQUEST_STATUS_DONE);
+            } else {
+                ap_request.result_code = ap_request.opcode;
+                ap_boot.ap_state = AP_BOOT_STATE_HALTED;
+                ap_boot.entry_state = AP_ENTRY_STATE_HALTED;
+                complete_ap_request(AP_REQUEST_STATUS_BAD_OP);
+            }
+            ap_halt_after_request();
+        }
+        __asm__ __volatile__("pause" : : : "memory");
+    }
+}
+
+static void send_ap_ping_request(ap_request_slot_t *slot, ap_boot_info_t *boot) {
+    reset_ap_request_slot(slot);
+    if (boot->ap_state == AP_BOOT_STATE_FAULTED) {
+        slot->status = AP_REQUEST_STATUS_FAULT;
+        return;
+    }
+    if (boot->error != AP_BOOT_OK || !boot->online) {
+        slot->status = AP_REQUEST_STATUS_SKIPPED;
+        return;
+    }
+
+    slot->opcode = AP_REQUEST_OP_PING;
+    slot->sequence = 1;
+    slot->request_id_high = 0x41502d50494e4721ULL;
+    slot->request_id_low = 0x0000000000000001ULL;
+    __asm__ __volatile__("mfence" : : : "memory");
+    slot->status = AP_REQUEST_STATUS_PENDING;
+
+    for (UINT32 i = 0; i < AP_REQUEST_TIMEOUT_LOOPS; i++) {
+        UINT32 status = slot->status;
+        if (ap_request_status_terminal(status)) {
+            slot->wait_loops = i;
+            return;
+        }
+        if (boot->ap_state == AP_BOOT_STATE_FAULTED) {
+            slot->wait_loops = i;
+            slot->status = AP_REQUEST_STATUS_FAULT;
+            return;
+        }
+        __asm__ __volatile__("pause" : : : "memory");
+    }
+
+    slot->wait_loops = AP_REQUEST_TIMEOUT_LOOPS;
+    if (!cmpxchg_u32(&slot->status, AP_REQUEST_STATUS_PENDING, AP_REQUEST_STATUS_TIMEOUT)) {
+        (void)cmpxchg_u32(&slot->status, AP_REQUEST_STATUS_RUNNING, AP_REQUEST_STATUS_TIMEOUT);
+    }
+}
+
 static void ap_entry_one(void) __attribute__((noreturn));
 static void ap_entry_one(void) {
     descriptor_table_ptr_t gdtr;
@@ -1415,14 +1588,7 @@ static void ap_entry_one(void) {
                       idtr.limit == (UINT16)(sizeof(ap_idt) - 1)) ? 1U : 0U;
     ap_boot.entry_state = AP_ENTRY_STATE_TABLES;
     run_ap_fault_test_if_enabled();
-    ap_boot.ap_state = AP_BOOT_STATE_HALTED;
-    ap_boot.entry_state = AP_ENTRY_STATE_HALTED;
-    __asm__ __volatile__("mfence" : : : "memory");
-    ap_boot.online = 1;
-
-    for (;;) {
-        __asm__ __volatile__("cli; hlt" : : : "memory");
-    }
+    ap_request_loop();
 }
 
 static int run_idt_self_test(void) {
@@ -2105,6 +2271,30 @@ static const char *ap_entry_state_name(UINT32 state) {
     case AP_ENTRY_STATE_TABLES: return "TABLES";
     case AP_ENTRY_STATE_HALTED: return "HALTED";
     case AP_ENTRY_STATE_FAULT: return "FAULT";
+    case AP_ENTRY_STATE_LOOP: return "LOOP";
+    case AP_ENTRY_STATE_REQUEST: return "REQUEST";
+    default: return "UNKNOWN";
+    }
+}
+
+static const char *ap_request_status_name(UINT32 status) {
+    switch (status) {
+    case AP_REQUEST_STATUS_EMPTY: return "EMPTY";
+    case AP_REQUEST_STATUS_PENDING: return "PENDING";
+    case AP_REQUEST_STATUS_RUNNING: return "RUNNING";
+    case AP_REQUEST_STATUS_DONE: return "DONE";
+    case AP_REQUEST_STATUS_TIMEOUT: return "TIMEOUT";
+    case AP_REQUEST_STATUS_BAD_OP: return "BAD-OP";
+    case AP_REQUEST_STATUS_FAULT: return "FAULT";
+    case AP_REQUEST_STATUS_SKIPPED: return "SKIPPED";
+    default: return "UNKNOWN";
+    }
+}
+
+static const char *ap_request_op_name(UINT32 opcode) {
+    switch (opcode) {
+    case AP_REQUEST_OP_NONE: return "NONE";
+    case AP_REQUEST_OP_PING: return "PING";
     default: return "UNKNOWN";
     }
 }
@@ -2174,6 +2364,43 @@ static void draw_ap_boot_info(framebuffer_t *fb, UINT32 *y, ap_boot_info_t *boot
     }
 }
 
+static void draw_ap_request_info(framebuffer_t *fb, UINT32 *y, ap_request_slot_t *request,
+                                 UINT32 fg, UINT32 accent, UINT32 warn, UINT32 bg) {
+    char line[192];
+    char *p;
+    int ok = request->status == AP_REQUEST_STATUS_DONE &&
+             request->opcode == AP_REQUEST_OP_PING &&
+             request->result_code == 0 &&
+             request->request_id_high == request->result_id_high &&
+             request->request_id_low == request->result_id_low;
+
+    p = append_str(line, "AP REQUEST: ");
+    p = append_str(p, ap_request_op_name(request->opcode));
+    p = append_str(p, ok ? " OK" : " NOT-OK");
+    p = append_str(p, "  STATUS: ");
+    p = append_str(p, ap_request_status_name(request->status));
+    p = append_str(p, "  SEQ: ");
+    p = append_dec(p, request->sequence);
+    p = append_str(p, "  WAIT: ");
+    p = append_dec(p, request->wait_loops);
+    p = append_str(p, "  COUNT: ");
+    append_dec(p, request->handled_count);
+    draw_line(fb, 48, y, line, ok ? accent : warn, bg, 2);
+
+    p = append_str(line, "AP REQ ID: ");
+    p = append_hex64(p, request->request_id_high);
+    *p++ = '-';
+    *p = 0;
+    p = append_hex64(p, request->request_id_low);
+    p = append_str(p, "  RESULT: ");
+    p = append_str(p, ok ? "MATCH" : "NO");
+    p = append_str(p, "  CS: ");
+    p = append_hex64(p, request->result_cs);
+    p = append_str(p, "  TR: ");
+    append_hex64(p, request->result_tr);
+    draw_line(fb, 48, y, line, ok ? fg : warn, bg, 2);
+}
+
 static int draw_map_line(framebuffer_t *fb, UINT32 *y, const char *s, UINT32 fg, UINT32 bg) {
     if (*y + 20 > fb->height) {
         return 0;
@@ -2198,8 +2425,8 @@ static UINT32 memory_line_color(EFI_MEMORY_DESCRIPTOR *desc, UINT32 fg, UINT32 m
 }
 
 static void draw_memory_map(framebuffer_t *fb, efi_memory_map_t *map, paging_info_t *paging,
-                            acpi_info_t *acpi, ap_boot_info_t *ap, UINT32 fg, UINT32 muted,
-                            UINT32 accent, UINT32 warn, UINT32 bg) {
+                            acpi_info_t *acpi, ap_boot_info_t *ap, ap_request_slot_t *request,
+                            UINT32 fg, UINT32 muted, UINT32 accent, UINT32 warn, UINT32 bg) {
     UINT64 conventional_pages = 0;
     UINT64 loader_pages = 0;
     UINT64 boot_pages = 0;
@@ -2291,6 +2518,9 @@ static void draw_memory_map(framebuffer_t *fb, efi_memory_map_t *map, paging_inf
 
     if (ap) {
         draw_ap_boot_info(fb, &y, ap, fg, accent, warn, bg);
+        if (request) {
+            draw_ap_request_info(fb, &y, request, fg, accent, warn, bg);
+        }
         y += 8;
     }
 
@@ -2582,10 +2812,12 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE image, EFI_SYSTEM_TABLE *st) {
     paging.idt_self_test_ok = run_idt_self_test() ? 1U : 0U;
     acpi_info_t acpi;
     parse_acpi(acpi_rsdp, &memory_map, &acpi);
+    reset_ap_request_slot(&ap_request);
     bring_up_one_ap(&ap_boot, &acpi, &memory_map, &paging);
+    send_ap_ping_request(&ap_request, &ap_boot);
 
     clear_screen(&fb, bg);
-    draw_memory_map(&fb, &memory_map, &paging, &acpi, &ap_boot, fg, muted, accent, warn, bg);
+    draw_memory_map(&fb, &memory_map, &paging, &acpi, &ap_boot, &ap_request, fg, muted, accent, warn, bg);
     run_fault_test_if_enabled();
 
     halt_forever();
