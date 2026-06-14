@@ -1,0 +1,75 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+repo_dir="$(cd -- "$script_dir/.." && pwd)"
+wait_seconds="${PXE_SMOKE_WAIT_SECONDS:-48}"
+output=""
+restore_needed=0
+
+usage() {
+  cat <<EOF
+Usage: $0 [--wait SECONDS] [--output PATH]
+
+Build the kernel EFI with the seventh AP request service set to an unknown ID,
+cycle PXE node power, wait for boot, and capture one HDMI screenshot for
+late BAD_OP stream-stop smoke review.
+EOF
+}
+
+restore_default_efi() {
+  if [[ "$restore_needed" -eq 1 ]]; then
+    printf '==> restoring default kernel EFI\n'
+    KERNEL_CFLAGS_EXTRA= "$repo_dir/kernel/build-kernel-efi"
+  fi
+}
+
+trap restore_default_efi EXIT
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --wait|-w)
+      wait_seconds="${2:-}"
+      shift 2
+      ;;
+    --output|-o)
+      output="${2:-}"
+      shift 2
+      ;;
+    --help|-h)
+      usage
+      exit 0
+      ;;
+    *)
+      printf 'error: unknown argument: %s\n' "$1" >&2
+      usage >&2
+      exit 2
+      ;;
+  esac
+done
+
+if [[ -z "$wait_seconds" || ! "$wait_seconds" =~ ^[0-9]+$ || "$wait_seconds" -eq 0 ]]; then
+  printf 'error: --wait must be a positive integer number of seconds\n' >&2
+  exit 2
+fi
+
+if [[ -z "$output" ]]; then
+  mkdir -p "$script_dir/captures"
+  output="$script_dir/captures/unknown-seventh-smoke-$(date +%Y%m%d-%H%M%S).jpg"
+fi
+
+printf '==> building unknown-seventh kernel EFI\n'
+KERNEL_CFLAGS_EXTRA="-DVIBE_AP_SECOND_BATCH_THIRD_REQUEST_SERVICE_ID=0x41502d53564300ffULL" \
+  "$repo_dir/kernel/build-kernel-efi"
+restore_needed=1
+
+printf '==> cycling PXE node power\n'
+"$script_dir/cycle-power" --yes
+
+printf '==> waiting %s seconds for boot\n' "$wait_seconds"
+sleep "$wait_seconds"
+
+printf '==> capturing HDMI screenshot\n'
+"$script_dir/capture-hdmi" --output "$output"
+
+printf 'SCREENSHOT: %s\n' "$output"
