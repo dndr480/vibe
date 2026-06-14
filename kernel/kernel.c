@@ -1,4 +1,5 @@
 #include "efi.h"
+#include "ap_request.h"
 
 typedef struct {
     UINT32 *base;
@@ -61,11 +62,6 @@ typedef struct {
 #ifndef VIBE_AP_REQUEST_FAULT_TEST
 #define VIBE_AP_REQUEST_FAULT_TEST 0
 #endif
-
-#define AP_REQUEST_SERVICE_PING 0x41502d5356430001ULL
-#define AP_REQUEST_INTERFACE_PING 0x41502d4946430001ULL
-#define AP_REQUEST_SERVICE_COUNTER 0x41502d5356430002ULL
-#define AP_REQUEST_INTERFACE_COUNTER_INCREMENT 0x41502d4946430002ULL
 
 #ifndef VIBE_AP_FIRST_REQUEST_OPCODE
 #define VIBE_AP_FIRST_REQUEST_OPCODE AP_REQUEST_OP_PING
@@ -265,23 +261,6 @@ enum {
     AP_FAULT_PHASE_STARTUP = 1,
     AP_FAULT_PHASE_LOOP = 2,
     AP_FAULT_PHASE_REQUEST = 3,
-};
-
-enum {
-    AP_REQUEST_STATUS_EMPTY = 0,
-    AP_REQUEST_STATUS_PENDING = 1,
-    AP_REQUEST_STATUS_RUNNING = 2,
-    AP_REQUEST_STATUS_DONE = 3,
-    AP_REQUEST_STATUS_TIMEOUT = 4,
-    AP_REQUEST_STATUS_BAD_OP = 5,
-    AP_REQUEST_STATUS_FAULT = 6,
-    AP_REQUEST_STATUS_SKIPPED = 7,
-};
-
-enum {
-    AP_REQUEST_OP_NONE = 0,
-    AP_REQUEST_OP_PING = 1,
-    AP_REQUEST_OP_COUNTER = 2,
 };
 
 enum {
@@ -547,45 +526,6 @@ typedef struct {
     UINT32 wait_loops;
     UINT32 icr_timeouts;
 } ap_boot_info_t;
-
-typedef struct {
-    volatile UINT32 source_cpu;
-    volatile UINT32 target_cpu;
-    volatile UINT32 opcode;
-    volatile UINT32 sequence;
-    volatile UINT64 service_id;
-    volatile UINT64 interface_id;
-    volatile UINT64 id_high;
-    volatile UINT64 id_low;
-} ap_request_header_t;
-
-typedef struct {
-    volatile UINT32 result_code;
-    volatile UINT32 fault_code;
-    volatile UINT64 request_id_high;
-    volatile UINT64 request_id_low;
-    volatile UINT64 result_cs;
-    volatile UINT64 result_tr;
-} ap_reply_header_t;
-
-typedef struct {
-    volatile UINT32 handled_count;
-    volatile UINT32 wait_loops;
-} ap_request_metrics_t;
-
-typedef struct {
-    UINT32 opcode;
-    UINT64 service_id;
-    UINT64 interface_id;
-    UINT32 sequence;
-} ap_request_plan_t;
-
-typedef struct {
-    volatile UINT32 state;
-    ap_request_header_t request;
-    ap_reply_header_t reply;
-    ap_request_metrics_t metrics;
-} ap_request_slot_t;
 
 typedef struct {
     ap_request_slot_t request;
