@@ -1594,8 +1594,22 @@ static void ap_request_loop(void) {
     }
 }
 
-static void send_ap_ping_request(ap_request_slot_t *slot, ap_boot_info_t *boot) {
+static void prepare_ap_ping_request(ap_request_slot_t *slot, UINT32 sequence, UINT32 handled_count) {
+    slot->metrics.handled_count = handled_count;
+    slot->request.source_cpu = 0;
+    slot->request.target_cpu = 1;
+    slot->request.opcode = AP_REQUEST_OP_PING;
+    slot->request.sequence = sequence;
+    slot->request.id_high = 0x41502d50494e4721ULL;
+    slot->request.id_low = sequence;
+}
+
+static void send_ap_ping_request(ap_request_slot_t *slot, ap_boot_info_t *boot, UINT32 sequence,
+                                 UINT32 keep_handled_count) {
+    UINT32 handled_count = keep_handled_count ? slot->metrics.handled_count : 0;
+
     reset_ap_request_slot(slot);
+    slot->metrics.handled_count = handled_count;
     if (boot->ap_state == AP_BOOT_STATE_FAULTED) {
         slot->reply.fault_code = (UINT32)boot->fault_vector;
         slot->state = AP_REQUEST_STATUS_FAULT;
@@ -1606,12 +1620,12 @@ static void send_ap_ping_request(ap_request_slot_t *slot, ap_boot_info_t *boot) 
         return;
     }
 
-    slot->request.source_cpu = 0;
-    slot->request.target_cpu = 1;
-    slot->request.opcode = AP_REQUEST_OP_PING;
-    slot->request.sequence = 1;
-    slot->request.id_high = 0x41502d50494e4721ULL;
-    slot->request.id_low = 0x0000000000000001ULL;
+    prepare_ap_ping_request(slot, sequence, handled_count);
+    if (boot->ap_state == AP_BOOT_STATE_HALTED) {
+        slot->state = AP_REQUEST_STATUS_SKIPPED;
+        return;
+    }
+
     __asm__ __volatile__("mfence" : : : "memory");
     slot->state = AP_REQUEST_STATUS_PENDING;
 
@@ -2943,7 +2957,10 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE image, EFI_SYSTEM_TABLE *st) {
     parse_acpi(acpi_rsdp, &memory_map, &acpi);
     reset_ap_request_slot(&ap_request);
     bring_up_one_ap(&ap_boot, &acpi, &memory_map, &paging);
-    send_ap_ping_request(&ap_request, &ap_boot);
+    send_ap_ping_request(&ap_request, &ap_boot, 1, 0);
+    if (ap_request.state == AP_REQUEST_STATUS_DONE && ap_boot.ap_state == AP_BOOT_STATE_HALTED) {
+        send_ap_ping_request(&ap_request, &ap_boot, 2, 1);
+    }
 
     clear_screen(&fb, bg);
     draw_memory_map(&fb, &memory_map, &paging, &acpi, &ap_boot, &ap_request, fg, muted, accent, warn, bg);
