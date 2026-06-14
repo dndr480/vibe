@@ -156,6 +156,10 @@ typedef struct {
 #define VIBE_AP_SECOND_BATCH_FOURTH_REQUEST_INTERFACE_ID AP_REQUEST_INTERFACE_PING
 #endif
 
+#ifndef VIBE_AP_REQUEST_TARGET_INDEX
+#define VIBE_AP_REQUEST_TARGET_INDEX 0
+#endif
+
 #define KERNEL_CODE_SELECTOR 0x08
 #define KERNEL_DATA_SELECTOR 0x10
 #define KERNEL_TSS_SELECTOR 0x18
@@ -637,16 +641,13 @@ static bsp_interrupt_observe_t bsp_interrupt_observe;
 static system_interrupt_observe_t system_interrupt_observe;
 static bsp_fault_display_t bsp_fault_display;
 static ap_context_t ap_contexts[MAX_AP_CONTEXTS];
-static ap_interrupt_observe_t *ap0_interrupts __attribute__((used)) = &ap_contexts[0].interrupts;
+static ap_context_t *ap_request_target_context = &ap_contexts[0];
+static ap_interrupt_observe_t *ap_request_interrupts __attribute__((used)) = &ap_contexts[0].interrupts;
 static volatile UINT64 system_lapic_base;
 static bsp_wait_observe_t bsp_wait_observe;
 
 static ap_context_t *ap0_context(void) {
     return &ap_contexts[0];
-}
-
-static int ap_context_is_ap0(ap_context_t *ctx) {
-    return ctx == &ap_contexts[0];
 }
 
 static UINT32 ap_context_index(ap_context_t *ctx) {
@@ -656,6 +657,23 @@ static UINT32 ap_context_index(ap_context_t *ctx) {
         }
     }
     return 0;
+}
+
+static void set_ap_request_target_context(ap_context_t *ctx) {
+    ap_request_target_context = ctx;
+    ap_request_interrupts = &ctx->interrupts;
+}
+
+static int ap_context_is_request_target(ap_context_t *ctx) {
+    return ctx == ap_request_target_context;
+}
+
+static ap_context_t *select_ap_request_target_context(UINTN context_count) {
+    UINTN target_index = VIBE_AP_REQUEST_TARGET_INDEX;
+    if (context_count == 0 || target_index >= context_count || target_index >= MAX_AP_CONTEXTS) {
+        return ap0_context();
+    }
+    return &ap_contexts[target_index];
 }
 
 static int address_in_range(UINT64 addr, UINT64 start, UINT64 size) {
@@ -758,7 +776,7 @@ __asm__(
     "isr_ap_request_kick_ipi:\n"
     "    pushq %rax\n"
     "    pushq %rdx\n"
-    "    movq ap0_interrupts(%rip), %rax\n"
+    "    movq ap_request_interrupts(%rip), %rax\n"
     "    movq 16(%rsp), %rdx\n"
     "    movq %rdx, 8(%rax)\n"
     "    movq 24(%rsp), %rdx\n"
@@ -781,7 +799,7 @@ __asm__(
     "isr_ap_request_ipi:\n"
     "    pushq %rax\n"
     "    pushq %rdx\n"
-    "    movq ap0_interrupts(%rip), %rax\n"
+    "    movq ap_request_interrupts(%rip), %rax\n"
     "    movq 16(%rsp), %rdx\n"
     "    movq %rdx, 40(%rax)\n"
     "    movq 24(%rsp), %rdx\n"
@@ -803,7 +821,7 @@ __asm__(
     ".global isr_ap_idle_timer\n"
     "isr_ap_idle_timer:\n"
     "    pushq %rax\n"
-    "    movq ap0_interrupts(%rip), %rax\n"
+    "    movq ap_request_interrupts(%rip), %rax\n"
     "    addl $1, 64(%rax)\n"
     "    movq system_lapic_base(%rip), %rax\n"
     "    testq %rax, %rax\n"
@@ -2152,7 +2170,7 @@ static void ap_request_loop(ap_context_t *ctx) {
         if (handled_work) {
             continue;
         }
-        if (!ap_context_is_ap0(ctx) || !ap_arm_idle_timer()) {
+        if (!ap_context_is_request_target(ctx) || !ap_arm_idle_timer()) {
             __asm__ __volatile__("sti; nop; pause; cli" : : : "memory");
             continue;
         }
@@ -2163,11 +2181,11 @@ static void ap_request_loop(ap_context_t *ctx) {
     }
 }
 
-static void prepare_ap_request(ap_request_slot_t *slot, UINT32 opcode, UINT64 service_id,
-                               UINT64 interface_id, UINT32 sequence) {
+static void prepare_ap_request(ap_request_slot_t *slot, UINT32 target_cpu, UINT32 opcode,
+                               UINT64 service_id, UINT64 interface_id, UINT32 sequence) {
     slot->metrics.handled_count = 0;
     slot->request.source_cpu = 0;
-    slot->request.target_cpu = 1;
+    slot->request.target_cpu = target_cpu;
     slot->request.opcode = opcode;
     slot->request.sequence = sequence;
     slot->request.service_id = service_id;
@@ -2180,7 +2198,8 @@ static void publish_ap_request(ap_context_t *ctx, ap_request_slot_t *slot, UINT3
                                UINT64 service_id, UINT64 interface_id, UINT32 sequence) {
     ap_boot_info_t *boot = &ctx->boot;
     reset_ap_request_slot(slot);
-    prepare_ap_request(slot, opcode, service_id, interface_id, sequence);
+    prepare_ap_request(slot, ap_context_index(ctx) + 1U, opcode, service_id,
+                       interface_id, sequence);
     if (boot->ap_state == AP_BOOT_STATE_FAULTED) {
         slot->reply.fault_code = (UINT32)boot->fault_vector;
         slot->state = AP_REQUEST_STATUS_FAULT;
@@ -3539,8 +3558,8 @@ static UINT32 memory_line_color(EFI_MEMORY_DESCRIPTOR *desc, UINT32 fg, UINT32 m
 }
 
 static void draw_ap_context_summary(framebuffer_t *fb, UINT32 *y, ap_context_t *contexts,
-                                    UINTN context_count, UINT32 fg, UINT32 accent,
-                                    UINT32 warn, UINT32 bg) {
+                                    UINTN context_count, ap_context_t *target_context,
+                                    UINT32 fg, UINT32 accent, UINT32 warn, UINT32 bg) {
     char line[192];
     char *p = append_str(line, "AP ONLINE: ");
     UINT32 online_count = 0;
@@ -3558,6 +3577,13 @@ static void draw_ap_context_summary(framebuffer_t *fb, UINT32 *y, ap_context_t *
     *p++ = '/';
     *p = 0;
     p = append_dec(p, (UINT32)context_count);
+    if (target_context) {
+        p = append_str(p, "  TARGET: ");
+        p = append_dec(p, ap_context_index(target_context) + 1U);
+        *p++ = '/';
+        *p = 0;
+        p = append_dec(p, target_context->boot.target_apic_id);
+    }
     p = append_str(p, "  APIC:");
     if (context_count == 0) {
         p = append_str(p, " NONE");
@@ -3576,7 +3602,7 @@ static void draw_ap_context_summary(framebuffer_t *fb, UINT32 *y, ap_context_t *
 }
 
 static void draw_memory_map(framebuffer_t *fb, efi_memory_map_t *map, paging_info_t *paging,
-                            acpi_info_t *acpi, ap_boot_info_t *ap,
+                            acpi_info_t *acpi, ap_context_t *target_context,
                             ap_context_t *ap_contexts, UINTN ap_context_count,
                             UINT32 fg, UINT32 muted, UINT32 accent, UINT32 warn, UINT32 bg) {
     UINT64 conventional_pages = 0;
@@ -3668,19 +3694,16 @@ static void draw_memory_map(framebuffer_t *fb, efi_memory_map_t *map, paging_inf
         y += 8;
     }
 
-    if (ap) {
+    if (target_context) {
         if (ap_contexts) {
-            draw_ap_context_summary(fb, &y, ap_contexts, ap_context_count, fg, accent, warn, bg);
+            draw_ap_context_summary(fb, &y, ap_contexts, ap_context_count, target_context,
+                                    fg, accent, warn, bg);
         }
-        draw_ap_boot_info(fb, &y, ap, fg, accent, warn, bg);
-        if (ap_contexts) {
-            draw_ap_queue_summary(fb, &y, &ap_contexts[0], fg, accent, warn, bg);
-        }
-        draw_ap_kick_summary(fb, &y, ap_contexts ? &ap_contexts[0] : 0, fg, accent, warn, bg);
-        if (ap_contexts) {
-            draw_ap_request_history(fb, &y, ap_contexts[0].request_history,
-                                    AP_REQUEST_HISTORY_COUNT, fg, accent, warn, bg);
-        }
+        draw_ap_boot_info(fb, &y, &target_context->boot, fg, accent, warn, bg);
+        draw_ap_queue_summary(fb, &y, target_context, fg, accent, warn, bg);
+        draw_ap_kick_summary(fb, &y, target_context, fg, accent, warn, bg);
+        draw_ap_request_history(fb, &y, target_context->request_history,
+                                AP_REQUEST_HISTORY_COUNT, fg, accent, warn, bg);
         y += 8;
     }
 
@@ -3976,6 +3999,8 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE image, EFI_SYSTEM_TABLE *st) {
     if (ap_context_count > MAX_AP_CONTEXTS) {
         ap_context_count = MAX_AP_CONTEXTS;
     }
+    ap_context_t *request_target = select_ap_request_target_context(ap_context_count);
+    set_ap_request_target_context(request_target);
     system_lapic_base = acpi.local_apic_base;
     zero_memory(&bsp_wait_observe, sizeof(bsp_wait_observe));
     zero_memory(&system_interrupt_observe, sizeof(system_interrupt_observe));
@@ -4004,11 +4029,11 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE image, EFI_SYSTEM_TABLE *st) {
         {VIBE_AP_SECOND_BATCH_FOURTH_REQUEST_OPCODE, VIBE_AP_SECOND_BATCH_FOURTH_REQUEST_SERVICE_ID,
          VIBE_AP_SECOND_BATCH_FOURTH_REQUEST_INTERFACE_ID, 8},
     };
-    (void)run_ap_request_stream(ap0, ap_request_plan,
+    (void)run_ap_request_stream(request_target, ap_request_plan,
                                 sizeof(ap_request_plan) / sizeof(ap_request_plan[0]));
 
     clear_screen(&fb, bg);
-    draw_memory_map(&fb, &memory_map, &paging, &acpi, &ap0->boot,
+    draw_memory_map(&fb, &memory_map, &paging, &acpi, request_target,
                     ap_contexts, ap_context_count,
                     fg, muted, accent, warn, bg);
     run_fault_test_if_enabled();
