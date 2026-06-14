@@ -64,17 +64,31 @@ typedef struct {
 
 #define AP_REQUEST_SERVICE_PING 0x41502d5356430001ULL
 #define AP_REQUEST_INTERFACE_PING 0x41502d4946430001ULL
+#define AP_REQUEST_SERVICE_COUNTER 0x41502d5356430002ULL
+#define AP_REQUEST_INTERFACE_COUNTER_INCREMENT 0x41502d4946430002ULL
+
+#ifndef VIBE_AP_FIRST_REQUEST_OPCODE
+#define VIBE_AP_FIRST_REQUEST_OPCODE AP_REQUEST_OP_PING
+#endif
+
+#ifndef VIBE_AP_FIRST_REQUEST_SERVICE_ID
+#define VIBE_AP_FIRST_REQUEST_SERVICE_ID AP_REQUEST_SERVICE_PING
+#endif
+
+#ifndef VIBE_AP_FIRST_REQUEST_INTERFACE_ID
+#define VIBE_AP_FIRST_REQUEST_INTERFACE_ID AP_REQUEST_INTERFACE_PING
+#endif
 
 #ifndef VIBE_AP_SECOND_REQUEST_OPCODE
-#define VIBE_AP_SECOND_REQUEST_OPCODE AP_REQUEST_OP_PING
+#define VIBE_AP_SECOND_REQUEST_OPCODE AP_REQUEST_OP_COUNTER
 #endif
 
 #ifndef VIBE_AP_SECOND_REQUEST_SERVICE_ID
-#define VIBE_AP_SECOND_REQUEST_SERVICE_ID AP_REQUEST_SERVICE_PING
+#define VIBE_AP_SECOND_REQUEST_SERVICE_ID AP_REQUEST_SERVICE_COUNTER
 #endif
 
 #ifndef VIBE_AP_SECOND_REQUEST_INTERFACE_ID
-#define VIBE_AP_SECOND_REQUEST_INTERFACE_ID AP_REQUEST_INTERFACE_PING
+#define VIBE_AP_SECOND_REQUEST_INTERFACE_ID AP_REQUEST_INTERFACE_COUNTER_INCREMENT
 #endif
 
 #define VIBE_AP_REQUEST_FAULT_TEST_NONE 0
@@ -177,6 +191,7 @@ enum {
 enum {
     AP_REQUEST_OP_NONE = 0,
     AP_REQUEST_OP_PING = 1,
+    AP_REQUEST_OP_COUNTER = 2,
 };
 
 static UINT32 color(framebuffer_t *fb, UINT8 r, UINT8 g, UINT8 b) {
@@ -503,6 +518,7 @@ static UINT32 kernel_warn;
 static uuid128_t current_request_uuid;
 static ap_boot_info_t ap_boot;
 static ap_request_slot_t ap_request;
+static volatile UINT32 ap_counter_value;
 static UINT8 ap_boot_stack[AP_BOOT_STACK_SIZE] __attribute__((aligned(16)));
 
 static int cmpxchg_u32(volatile UINT32 *ptr, UINT32 expected, UINT32 desired);
@@ -1574,6 +1590,18 @@ static void ap_handle_ping_request(ap_request_slot_t *slot) {
     slot->metrics.handled_count = slot->metrics.handled_count + 1U;
 }
 
+static void ap_handle_counter_increment(ap_request_slot_t *slot) {
+#if VIBE_AP_REQUEST_FAULT_TEST == VIBE_AP_REQUEST_FAULT_TEST_UD2
+    __asm__ __volatile__("ud2" : : : "memory");
+#endif
+    ap_counter_value = ap_counter_value + 1U;
+    slot->reply.result_cs = read_cs();
+    slot->reply.result_tr = read_tr();
+    slot->reply.result_code = ap_counter_value;
+    slot->reply.fault_code = 0;
+    slot->metrics.handled_count = slot->metrics.handled_count + 1U;
+}
+
 typedef void (*ap_request_handler_t)(ap_request_slot_t *slot);
 
 typedef struct {
@@ -1584,6 +1612,7 @@ typedef struct {
 
 static const ap_request_dispatch_entry_t ap_request_dispatch_table[] = {
     {AP_REQUEST_SERVICE_PING, AP_REQUEST_INTERFACE_PING, ap_handle_ping_request},
+    {AP_REQUEST_SERVICE_COUNTER, AP_REQUEST_INTERFACE_COUNTER_INCREMENT, ap_handle_counter_increment},
 };
 
 static ap_request_handler_t find_ap_request_handler(UINT64 service_id, UINT64 interface_id) {
@@ -2459,8 +2488,33 @@ static const char *ap_request_op_name(UINT32 opcode) {
     switch (opcode) {
     case AP_REQUEST_OP_NONE: return "NONE";
     case AP_REQUEST_OP_PING: return "PING";
+    case AP_REQUEST_OP_COUNTER: return "COUNTER";
     default: return "UNKNOWN";
     }
+}
+
+static int ap_request_result_ok(ap_request_slot_t *request) {
+    if (request->state != AP_REQUEST_STATUS_DONE ||
+        request->reply.fault_code != 0 ||
+        request->request.id_high != request->reply.request_id_high ||
+        request->request.id_low != request->reply.request_id_low) {
+        return 0;
+    }
+
+    if (request->request.service_id == AP_REQUEST_SERVICE_PING &&
+        request->request.interface_id == AP_REQUEST_INTERFACE_PING) {
+        return request->request.opcode == AP_REQUEST_OP_PING &&
+               request->reply.result_code == 0;
+    }
+
+    if (request->request.service_id == AP_REQUEST_SERVICE_COUNTER &&
+        request->request.interface_id == AP_REQUEST_INTERFACE_COUNTER_INCREMENT) {
+        return request->request.opcode == AP_REQUEST_OP_COUNTER &&
+               request->reply.result_code == ap_counter_value &&
+               ap_counter_value > 0;
+    }
+
+    return 0;
 }
 
 static void draw_ap_boot_info(framebuffer_t *fb, UINT32 *y, ap_boot_info_t *boot, UINT32 fg,
@@ -2555,14 +2609,7 @@ static void draw_ap_request_info(framebuffer_t *fb, UINT32 *y, ap_request_slot_t
                                  UINT32 fg, UINT32 accent, UINT32 warn, UINT32 bg) {
     char line[192];
     char *p;
-    int ok = request->state == AP_REQUEST_STATUS_DONE &&
-             request->request.opcode == AP_REQUEST_OP_PING &&
-             request->request.service_id == AP_REQUEST_SERVICE_PING &&
-             request->request.interface_id == AP_REQUEST_INTERFACE_PING &&
-             request->reply.result_code == 0 &&
-             request->reply.fault_code == 0 &&
-             request->request.id_high == request->reply.request_id_high &&
-             request->request.id_low == request->reply.request_id_low;
+    int ok = ap_request_result_ok(request);
     int has_reply_id = request->reply.request_id_high != 0 || request->reply.request_id_low != 0;
     int has_terminal_reply = has_reply_id &&
                              (request->state == AP_REQUEST_STATUS_DONE ||
@@ -3028,9 +3075,10 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE image, EFI_SYSTEM_TABLE *st) {
     acpi_info_t acpi;
     parse_acpi(acpi_rsdp, &memory_map, &acpi);
     reset_ap_request_slot(&ap_request);
+    ap_counter_value = 0;
     bring_up_one_ap(&ap_boot, &acpi, &memory_map, &paging);
-    send_ap_request(&ap_request, &ap_boot, AP_REQUEST_OP_PING, AP_REQUEST_SERVICE_PING,
-                    AP_REQUEST_INTERFACE_PING, 1, 0);
+    send_ap_request(&ap_request, &ap_boot, VIBE_AP_FIRST_REQUEST_OPCODE,
+                    VIBE_AP_FIRST_REQUEST_SERVICE_ID, VIBE_AP_FIRST_REQUEST_INTERFACE_ID, 1, 0);
     if (ap_request.state == AP_REQUEST_STATUS_DONE && ap_boot.ap_state != AP_BOOT_STATE_FAULTED) {
         send_ap_request(&ap_request, &ap_boot, VIBE_AP_SECOND_REQUEST_OPCODE,
                         VIBE_AP_SECOND_REQUEST_SERVICE_ID, VIBE_AP_SECOND_REQUEST_INTERFACE_ID, 2, 1);
