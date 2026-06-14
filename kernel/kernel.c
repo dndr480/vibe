@@ -697,7 +697,7 @@ static UINT32 kernel_accent;
 static UINT32 kernel_warn;
 static ap_context_t ap_contexts[1];
 static ap_interrupt_observe_t *ap0_interrupts __attribute__((used)) = &ap_contexts[0].interrupts;
-static volatile UINT64 ap_lapic_base;
+static volatile UINT64 system_lapic_base;
 static bsp_wait_observe_t bsp_wait_observe;
 
 static ap_context_t *ap0_context(void) {
@@ -794,7 +794,7 @@ __asm__(
     "    movl 4(%rax), %edx\n"
     "    addl $1, %edx\n"
     "    movl %edx, 4(%rax)\n"
-    "    movq ap_lapic_base(%rip), %rax\n"
+    "    movq system_lapic_base(%rip), %rax\n"
     "    testq %rax, %rax\n"
     "    jz 6f\n"
     "    movl $0, 0xb0(%rax)\n"
@@ -817,7 +817,7 @@ __asm__(
     "    movl 36(%rax), %edx\n"
     "    addl $1, %edx\n"
     "    movl %edx, 36(%rax)\n"
-    "    movq ap_lapic_base(%rip), %rax\n"
+    "    movq system_lapic_base(%rip), %rax\n"
     "    testq %rax, %rax\n"
     "    jz 5f\n"
     "    movl $0, 0xb0(%rax)\n"
@@ -830,7 +830,7 @@ __asm__(
     "    pushq %rax\n"
     "    movq ap0_interrupts(%rip), %rax\n"
     "    addl $1, 64(%rax)\n"
-    "    movq ap_lapic_base(%rip), %rax\n"
+    "    movq system_lapic_base(%rip), %rax\n"
     "    testq %rax, %rax\n"
     "    jz 7f\n"
     "    movl $0, 0xb0(%rax)\n"
@@ -843,7 +843,7 @@ __asm__(
     "    movl bsp_wait_observe+8(%rip), %eax\n"
     "    addl $1, %eax\n"
     "    movl %eax, bsp_wait_observe+8(%rip)\n"
-    "    movq ap_lapic_base(%rip), %rax\n"
+    "    movq system_lapic_base(%rip), %rax\n"
     "    testq %rax, %rax\n"
     "    jz 8f\n"
     "    movl $0, 0xb0(%rax)\n"
@@ -1474,7 +1474,7 @@ static const char *fault_vector_name(UINT64 vector) {
 }
 
 static void ap_notify_bsp_request_complete(ap_context_t *ctx) {
-    UINT64 base = ap_lapic_base;
+    UINT64 base = system_lapic_base;
     UINT32 apic_id = ctx->completion_target_apic_id;
     ap_boot_info_t *boot = &ctx->boot;
     if (base == 0) {
@@ -1491,7 +1491,7 @@ static void ap_notify_bsp_request_complete(ap_context_t *ctx) {
 }
 
 static void bsp_notify_ap_request_pending(ap_context_t *ctx) {
-    UINT64 base = ap_lapic_base;
+    UINT64 base = system_lapic_base;
     ap_boot_info_t *boot = &ctx->boot;
     if (base == 0 || boot->error != AP_BOOT_OK || !boot->online ||
         boot->ap_state == AP_BOOT_STATE_HALTED ||
@@ -2122,7 +2122,7 @@ static UINT32 ap_dispatch_miss_result_code(UINT64 service_id, UINT64 interface_i
 }
 
 static void ap_disarm_idle_timer(void) {
-    UINT64 base = ap_lapic_base;
+    UINT64 base = system_lapic_base;
     if (base == 0) {
         return;
     }
@@ -2132,7 +2132,7 @@ static void ap_disarm_idle_timer(void) {
 }
 
 static int ap_arm_idle_timer(void) {
-    UINT64 base = ap_lapic_base;
+    UINT64 base = system_lapic_base;
     if (base == 0) {
         return 0;
     }
@@ -2144,7 +2144,7 @@ static int ap_arm_idle_timer(void) {
 }
 
 static void bsp_disarm_wait_timer(void) {
-    UINT64 base = ap_lapic_base;
+    UINT64 base = system_lapic_base;
     if (base == 0) {
         return;
     }
@@ -2154,7 +2154,7 @@ static void bsp_disarm_wait_timer(void) {
 }
 
 static int bsp_arm_wait_timer(void) {
-    UINT64 base = ap_lapic_base;
+    UINT64 base = system_lapic_base;
     if (base == 0) {
         return 0;
     }
@@ -2538,8 +2538,8 @@ static void ap_entry_one(void) {
     load_cpu_tables(cpu);
     init_ap_idt(ctx);
     load_idt_entries(ctx->idt);
-    if (ap_lapic_base != 0) {
-        enable_lapic_if_needed(ap_lapic_base);
+    if (system_lapic_base != 0) {
+        enable_lapic_if_needed(system_lapic_base);
         ap_disarm_idle_timer();
     }
 
@@ -3990,7 +3990,7 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE image, EFI_SYSTEM_TABLE *st) {
     ap0->idle_wake_count = 0;
     ap0->completion_target_apic_id = acpi.bsp_apic_id;
     zero_memory(&ap0->interrupts, sizeof(ap0->interrupts));
-    ap_lapic_base = acpi.local_apic_base;
+    system_lapic_base = acpi.local_apic_base;
     zero_memory(&bsp_wait_observe, sizeof(bsp_wait_observe));
     zero_memory(&system_interrupt_observe, sizeof(system_interrupt_observe));
     bring_up_one_ap(ap0, &acpi, &memory_map, &paging);
