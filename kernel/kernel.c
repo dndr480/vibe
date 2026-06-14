@@ -633,6 +633,12 @@ _Static_assert(__builtin_offsetof(ap_interrupt_observe_t, idle_timer_count) == 6
                "AP idle timer count offset must match ISR writes");
 
 typedef struct {
+    interrupt_trace_t idt_self_test;
+} bsp_interrupt_observe_t;
+_Static_assert(__builtin_offsetof(bsp_interrupt_observe_t, idt_self_test) == 0,
+               "BSP IDT self-test trace offset must match ISR writes");
+
+typedef struct {
     volatile UINT32 halt_count;
     volatile UINT32 wake_count;
     volatile UINT32 timer_count;
@@ -676,7 +682,7 @@ typedef struct {
 static idt_entry_t idt[256];
 static cpu_local_t cpu0;
 static cpu_local_t *current_cpu = &cpu0;
-static interrupt_trace_t interrupt_trace;
+static bsp_interrupt_observe_t bsp_interrupt_observe;
 static interrupt_trace_t spurious_interrupt_trace;
 static framebuffer_t kernel_framebuffer;
 static UINT32 kernel_bg;
@@ -724,15 +730,15 @@ __asm__(
     "isr_breakpoint:\n"
     "    pushq %rax\n"
     "    movq 8(%rsp), %rax\n"
-    "    movq %rax, interrupt_trace+8(%rip)\n"
+    "    movq %rax, bsp_interrupt_observe+8(%rip)\n"
     "    movq 16(%rsp), %rax\n"
-    "    movq %rax, interrupt_trace+16(%rip)\n"
+    "    movq %rax, bsp_interrupt_observe+16(%rip)\n"
     "    movq 24(%rsp), %rax\n"
-    "    movq %rax, interrupt_trace+24(%rip)\n"
-    "    movl $3, interrupt_trace(%rip)\n"
-    "    movl interrupt_trace+4(%rip), %eax\n"
+    "    movq %rax, bsp_interrupt_observe+24(%rip)\n"
+    "    movl $3, bsp_interrupt_observe(%rip)\n"
+    "    movl bsp_interrupt_observe+4(%rip), %eax\n"
     "    addl $1, %eax\n"
-    "    movl %eax, interrupt_trace+4(%rip)\n"
+    "    movl %eax, bsp_interrupt_observe+4(%rip)\n"
     "    popq %rax\n"
     "    iretq\n"
     ".global isr_fault_ud\n"
@@ -2550,15 +2556,16 @@ static void ap_entry_one(void) {
 }
 
 static int run_idt_self_test(void) {
-    interrupt_trace.vector = 0;
-    interrupt_trace.count = 0;
-    interrupt_trace.rip = 0;
-    interrupt_trace.cs = 0;
-    interrupt_trace.rflags = 0;
+    interrupt_trace_t *trace = &bsp_interrupt_observe.idt_self_test;
+    trace->vector = 0;
+    trace->count = 0;
+    trace->rip = 0;
+    trace->cs = 0;
+    trace->rflags = 0;
 
     __asm__ __volatile__("int3" : : : "memory");
 
-    return interrupt_trace.vector == 3 && interrupt_trace.count == 1;
+    return trace->vector == 3 && trace->count == 1;
 }
 
 static void run_fault_test_if_enabled(void) {
