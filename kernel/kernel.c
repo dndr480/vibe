@@ -605,6 +605,7 @@ typedef struct {
 
 typedef struct {
     ap_boot_info_t boot;
+    UINT8 boot_stack[AP_BOOT_STACK_SIZE] __attribute__((aligned(16)));
     ap_request_slot_t request_slots[AP_REQUEST_SLOT_COUNT];
     ap_request_history_entry_t request_history[AP_REQUEST_HISTORY_COUNT];
     ap_queue_summary_t queue_summary;
@@ -662,7 +663,6 @@ static volatile UINT32 ap_request_kick_ipi_send_count;
 static volatile UINT32 ap_request_kick_ipi_send_fail_count;
 static volatile UINT32 ap_request_ipi_send_count;
 static volatile UINT32 ap_request_ipi_send_fail_count;
-static UINT8 ap_boot_stack[AP_BOOT_STACK_SIZE] __attribute__((aligned(16)));
 
 static ap_context_t *ap0_context(void) {
     return &ap_contexts[0];
@@ -2948,7 +2948,8 @@ static int select_ap_target(acpi_info_t *acpi, ap_boot_info_t *boot) {
     return 0;
 }
 
-static int build_ap_trampoline(ap_boot_info_t *boot, paging_info_t *paging) {
+static int build_ap_trampoline(ap_context_t *ctx, paging_info_t *paging) {
+    ap_boot_info_t *boot = &ctx->boot;
     if (boot->trampoline_base == 0 || boot->trampoline_base >= 0x100000ULL ||
         (boot->trampoline_base & (PAGE_SIZE_4K - 1)) != 0 || boot->sipi_vector == 0 ||
         boot->sipi_vector > 0xff) {
@@ -2964,7 +2965,7 @@ static int build_ap_trampoline(ap_boot_info_t *boot, paging_info_t *paging) {
     for (UINT32 i = 0; i < PAGE_SIZE_4K; i++) {
         page[i] = 0;
     }
-    boot->stack_top = (UINT64)(UINTN)(ap_boot_stack + sizeof(ap_boot_stack));
+    boot->stack_top = (UINT64)(UINTN)(ctx->boot_stack + sizeof(ctx->boot_stack));
 
     UINT8 *p = page;
     emit8(&p, 0xfa);                         /* cli */
@@ -3082,7 +3083,9 @@ static void enable_lapic_if_needed(UINT64 base) {
     }
 }
 
-static void bring_up_one_ap(ap_boot_info_t *boot, acpi_info_t *acpi, efi_memory_map_t *map, paging_info_t *paging) {
+static void bring_up_one_ap(ap_context_t *ctx, acpi_info_t *acpi, efi_memory_map_t *map,
+                            paging_info_t *paging) {
+    ap_boot_info_t *boot = &ctx->boot;
     boot->online = 0;
     boot->ap_state = AP_BOOT_STATE_NONE;
     boot->entry_state = AP_ENTRY_STATE_NONE;
@@ -3125,7 +3128,7 @@ static void bring_up_one_ap(ap_boot_info_t *boot, acpi_info_t *acpi, efi_memory_
         boot->error = AP_BOOT_ERR_LAPIC_RANGE;
         return;
     }
-    if (!build_ap_trampoline(boot, paging)) {
+    if (!build_ap_trampoline(ctx, paging)) {
         return;
     }
     __asm__ __volatile__("mfence" : : : "memory");
@@ -3963,7 +3966,7 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE image, EFI_SYSTEM_TABLE *st) {
     ap_request_kick_ipi_send_fail_count = 0;
     ap_request_ipi_send_count = 0;
     ap_request_ipi_send_fail_count = 0;
-    bring_up_one_ap(&ap0->boot, &acpi, &memory_map, &paging);
+    bring_up_one_ap(ap0, &acpi, &memory_map, &paging);
     const ap_request_plan_t ap_request_plan[] = {
         {VIBE_AP_FIRST_REQUEST_OPCODE, VIBE_AP_FIRST_REQUEST_SERVICE_ID,
          VIBE_AP_FIRST_REQUEST_INTERFACE_ID, 1},
