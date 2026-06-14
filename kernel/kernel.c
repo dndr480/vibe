@@ -662,6 +662,14 @@ typedef struct {
 } bsp_context_t;
 
 typedef struct {
+    framebuffer_t framebuffer;
+    UINT32 bg;
+    UINT32 fg;
+    UINT32 accent;
+    UINT32 warn;
+} bsp_fault_display_t;
+
+typedef struct {
     ap_boot_info_t boot;
     UINT8 boot_stack[AP_BOOT_STACK_SIZE] __attribute__((aligned(16)));
     cpu_local_t cpu;
@@ -693,11 +701,7 @@ typedef struct {
 static bsp_context_t bsp_context;
 static bsp_interrupt_observe_t bsp_interrupt_observe;
 static system_interrupt_observe_t system_interrupt_observe;
-static framebuffer_t kernel_framebuffer;
-static UINT32 kernel_bg;
-static UINT32 kernel_fg;
-static UINT32 kernel_accent;
-static UINT32 kernel_warn;
+static bsp_fault_display_t bsp_fault_display;
 static ap_context_t ap_contexts[1];
 static ap_interrupt_observe_t *ap0_interrupts __attribute__((used)) = &ap_contexts[0].interrupts;
 static volatile UINT64 system_lapic_base;
@@ -1512,7 +1516,8 @@ static void bsp_notify_ap_request_pending(ap_context_t *ctx) {
 }
 
 void fault_dispatch(fault_frame_t *frame) {
-    framebuffer_t *fb = &kernel_framebuffer;
+    bsp_fault_display_t *display = &bsp_fault_display;
+    framebuffer_t *fb = &display->framebuffer;
     char line[192];
     char *p;
     UINT32 y = 48;
@@ -1525,8 +1530,8 @@ void fault_dispatch(fault_frame_t *frame) {
         }
     }
 
-    clear_screen(fb, kernel_bg);
-    draw_text(fb, 48, y, "BSP FAULT", kernel_warn, kernel_bg, 4);
+    clear_screen(fb, display->bg);
+    draw_text(fb, 48, y, "BSP FAULT", display->warn, display->bg, 4);
     y += 64;
 
     p = append_str(line, "VECTOR: ");
@@ -1535,7 +1540,7 @@ void fault_dispatch(fault_frame_t *frame) {
     p = append_str(p, fault_vector_name(frame->vector));
     p = append_str(p, "  ERROR: ");
     append_hex64(p, frame->error_code);
-    draw_line(fb, 48, &y, line, kernel_fg, kernel_bg, 2);
+    draw_line(fb, 48, &y, line, display->fg, display->bg, 2);
 
     p = append_str(line, "RIP: ");
     p = append_hex64(p, frame->rip);
@@ -1543,13 +1548,13 @@ void fault_dispatch(fault_frame_t *frame) {
     p = append_hex64(p, frame->cs);
     p = append_str(p, "  RFLAGS: ");
     append_hex64(p, frame->rflags);
-    draw_line(fb, 48, &y, line, kernel_fg, kernel_bg, 2);
+    draw_line(fb, 48, &y, line, display->fg, display->bg, 2);
 
     p = append_str(line, "CR2: ");
     p = append_hex64(p, read_cr2());
     p = append_str(p, "  CR3: ");
     append_hex64(p, read_cr3());
-    draw_line(fb, 48, &y, line, kernel_fg, kernel_bg, 2);
+    draw_line(fb, 48, &y, line, display->fg, display->bg, 2);
 
     cpu_local_t *cpu = &bsp_context.cpu;
     p = append_str(line, "CPU: ");
@@ -1560,17 +1565,17 @@ void fault_dispatch(fault_frame_t *frame) {
     p = append_hex64(p, cpu ? cpu->loaded_tr : 0);
     p = append_str(p, "  TSS: ");
     append_str(p, cpu && cpu->tss_ready ? "READY" : "NOT-READY");
-    draw_line(fb, 48, &y, line, kernel_fg, kernel_bg, 2);
+    draw_line(fb, 48, &y, line, display->fg, display->bg, 2);
 
     p = append_str(line, "IST1: ");
     p = append_hex64(p, cpu ? cpu->tss.ist[CPU_IST_FAULT - 1] : 0);
     p = append_str(p, "  IST2: ");
     append_hex64(p, cpu ? cpu->tss.ist[CPU_IST_DOUBLE_FAULT - 1] : 0);
-    draw_line(fb, 48, &y, line, kernel_fg, kernel_bg, 2);
+    draw_line(fb, 48, &y, line, display->fg, display->bg, 2);
 
-    draw_line(fb, 48, &y, "CURRENT REQUEST: N/A", kernel_accent, kernel_bg, 2);
+    draw_line(fb, 48, &y, "CURRENT REQUEST: N/A", display->accent, display->bg, 2);
 
-    draw_line(fb, 48, &y, "HALTED", kernel_warn, kernel_bg, 2);
+    draw_line(fb, 48, &y, "HALTED", display->warn, display->bg, 2);
 
     for (;;) {
         __asm__ __volatile__("hlt");
@@ -3959,11 +3964,11 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE image, EFI_SYSTEM_TABLE *st) {
     UINT32 muted = color(&fb, 0xa8, 0xb0, 0xb8);
     UINT32 warn = color(&fb, 0xff, 0xc8, 0x5c);
 
-    kernel_framebuffer = fb;
-    kernel_bg = bg;
-    kernel_fg = fg;
-    kernel_accent = accent;
-    kernel_warn = warn;
+    bsp_fault_display.framebuffer = fb;
+    bsp_fault_display.bg = bg;
+    bsp_fault_display.fg = fg;
+    bsp_fault_display.accent = accent;
+    bsp_fault_display.warn = warn;
     init_cpu_local(&bsp_context.cpu, 0);
     install_cpu_tables(&bsp_context.cpu);
     install_bsp_idt();
