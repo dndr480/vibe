@@ -5,6 +5,11 @@ script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 repo_dir="$(cd -- "$script_dir/.." && pwd)"
 build_dir="$script_dir/build"
 out="${1:-$repo_dir/pxenode1/pxe/www/kernel/kernel.efi}"
+extra_cflags=()
+
+if [[ -n "${KERNEL_CFLAGS_EXTRA:-}" ]]; then
+  read -r -a extra_cflags <<<"$KERNEL_CFLAGS_EXTRA"
+fi
 
 mkdir -p "$build_dir" "$(dirname -- "$out")"
 
@@ -28,6 +33,7 @@ for src in "${c_sources[@]}"; do
     -fpic \
     -mno-red-zone \
     -maccumulate-outgoing-args \
+    "${extra_cflags[@]}" \
     -c "$src" \
     -o "$obj"
 done

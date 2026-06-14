@@ -1,0 +1,34 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+out_dir="${1:-$script_dir/build/test-builds}"
+
+mkdir -p "$out_dir"
+
+run_variant() {
+  local name="$1"
+  shift
+
+  local out="$out_dir/$name.efi"
+  local extra_flags="$*"
+
+  printf '==> building %s\n' "$name"
+  if [[ -n "$extra_flags" ]]; then
+    printf '    KERNEL_CFLAGS_EXTRA=%s\n' "$extra_flags"
+  fi
+
+  KERNEL_CFLAGS_EXTRA="$extra_flags" "$script_dir/build-kernel-efi" "$out"
+}
+
+run_variant default
+run_variant target-ap1 -DVIBE_AP_REQUEST_TARGET_INDEX=1
+run_variant target-ap2 -DVIBE_AP_REQUEST_TARGET_INDEX=2
+run_variant ap-ud2 -DVIBE_AP_REQUEST_FAULT_TEST=1
+run_variant hang-short-timeout \
+  -DVIBE_AP_REQUEST_FAULT_TEST=2 \
+  -DAP_REQUEST_TIMEOUT_LOOPS=1000000U \
+  -DBSP_WAIT_TIMER_TIMEOUT_STEP=10000U
+
+printf '==> restoring default EFI\n'
+"$script_dir/build-kernel-efi"
