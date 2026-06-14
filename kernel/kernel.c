@@ -487,6 +487,13 @@ typedef struct {
 } ap_request_metrics_t;
 
 typedef struct {
+    UINT32 opcode;
+    UINT64 service_id;
+    UINT64 interface_id;
+    UINT32 sequence;
+} ap_request_plan_t;
+
+typedef struct {
     volatile UINT32 state;
     ap_request_header_t request;
     ap_reply_header_t reply;
@@ -1864,6 +1871,16 @@ static void publish_ap_request(ap_request_slot_t *slot, ap_boot_info_t *boot, UI
 
     __asm__ __volatile__("mfence" : : : "memory");
     slot->state = AP_REQUEST_STATUS_PENDING;
+}
+
+static void publish_ap_request_batch(ap_request_slot_t *slots, UINTN slot_count,
+                                     ap_boot_info_t *boot, const ap_request_plan_t *plan,
+                                     UINTN plan_count) {
+    UINTN count = slot_count < plan_count ? slot_count : plan_count;
+    for (UINTN i = 0; i < count; i++) {
+        publish_ap_request(&slots[i], boot, plan[i].opcode, plan[i].service_id,
+                           plan[i].interface_id, plan[i].sequence);
+    }
 }
 
 static void wait_for_ap_requests(ap_request_slot_t *slots, UINTN count, ap_boot_info_t *boot) {
@@ -3348,10 +3365,14 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE image, EFI_SYSTEM_TABLE *st) {
     ap_request_handled_count = 0;
     ap_counter_value = 0;
     bring_up_one_ap(&ap_boot, &acpi, &memory_map, &paging);
-    publish_ap_request(&ap_request_slots[0], &ap_boot, VIBE_AP_FIRST_REQUEST_OPCODE,
-                       VIBE_AP_FIRST_REQUEST_SERVICE_ID, VIBE_AP_FIRST_REQUEST_INTERFACE_ID, 1);
-    publish_ap_request(&ap_request_slots[1], &ap_boot, VIBE_AP_SECOND_REQUEST_OPCODE,
-                       VIBE_AP_SECOND_REQUEST_SERVICE_ID, VIBE_AP_SECOND_REQUEST_INTERFACE_ID, 2);
+    const ap_request_plan_t ap_request_plan[AP_REQUEST_SLOT_COUNT] = {
+        {VIBE_AP_FIRST_REQUEST_OPCODE, VIBE_AP_FIRST_REQUEST_SERVICE_ID,
+         VIBE_AP_FIRST_REQUEST_INTERFACE_ID, 1},
+        {VIBE_AP_SECOND_REQUEST_OPCODE, VIBE_AP_SECOND_REQUEST_SERVICE_ID,
+         VIBE_AP_SECOND_REQUEST_INTERFACE_ID, 2},
+    };
+    publish_ap_request_batch(ap_request_slots, AP_REQUEST_SLOT_COUNT, &ap_boot,
+                             ap_request_plan, AP_REQUEST_SLOT_COUNT);
     wait_for_ap_requests(ap_request_slots, AP_REQUEST_SLOT_COUNT, &ap_boot);
     snapshot_ap_requests(ap_request_slots, AP_REQUEST_SLOT_COUNT);
 
