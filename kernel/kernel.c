@@ -707,6 +707,10 @@ static int ap_context_is_schedulable(ap_context_t *ctx) {
            boot->ap_state != AP_BOOT_STATE_FAULTED;
 }
 
+static int ap_request_fault_test_enabled(void) {
+    return VIBE_AP_REQUEST_FAULT_TEST != VIBE_AP_REQUEST_FAULT_TEST_NONE;
+}
+
 static void build_online_ap_registry(ap_scheduler_t *scheduler, ap_context_t *contexts,
                                      UINTN context_count) {
     UINT32 next_index = scheduler->next_index;
@@ -2471,6 +2475,16 @@ static int run_ap_request_stream(ap_context_t *ctx, const ap_request_plan_t *pla
     for (UINTN i = 0; i < AP_REQUEST_SLOT_COUNT; i++) {
         active[i] = 0;
         reset_ap_request_slot(&slots[i]);
+    }
+
+    if (ap_request_stream_should_stop(ctx)) {
+        ap_boot_info_t *boot = &ctx->boot;
+        if (boot->ap_state == AP_BOOT_STATE_FAULTED) {
+            ctx->queue_summary.stop_reason = AP_QUEUE_STOP_FAULT;
+        } else {
+            ctx->queue_summary.stop_reason = AP_QUEUE_STOP_BAD_OP;
+        }
+        return 0;
     }
 
     for (UINTN slot_index = 0; slot_index < count && next_plan < plan_count; slot_index++) {
@@ -4318,7 +4332,11 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE image, EFI_SYSTEM_TABLE *st) {
     ap_context_t *request_target = select_ap_request_target_context(&ap_scheduler, ap_contexts,
                                                                     ap_context_count);
     set_ap_request_target_context(request_target);
-    run_ap_broadcast_ping(ap_contexts, ap_context_count, request_target);
+    if (ap_request_fault_test_enabled()) {
+        reset_ap_broadcast_ping_summary();
+    } else {
+        run_ap_broadcast_ping(ap_contexts, ap_context_count, request_target);
+    }
     const ap_request_plan_t ap_request_plan[] = {
         {VIBE_AP_FIRST_REQUEST_OPCODE, VIBE_AP_FIRST_REQUEST_SERVICE_ID,
          VIBE_AP_FIRST_REQUEST_INTERFACE_ID, 1},

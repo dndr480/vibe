@@ -3,6 +3,14 @@
 
 #include "ap_request.h"
 
+#ifndef VIBE_AP_REQUEST_FAULT_TEST
+#define VIBE_AP_REQUEST_FAULT_TEST 0
+#endif
+
+#define VIBE_AP_REQUEST_FAULT_TEST_NONE 0
+#define VIBE_AP_REQUEST_FAULT_TEST_UD2 1
+#define VIBE_AP_REQUEST_FAULT_TEST_HANG 2
+
 typedef struct {
     volatile UINT32 *request_handled_count;
     volatile UINT32 *counter_value;
