@@ -34,6 +34,13 @@ typedef struct {
     volatile UINT64 interface_id;
     volatile UINT64 id_high;
     volatile UINT64 id_low;
+    volatile UINT64 parent_id_high;
+    volatile UINT64 parent_id_low;
+    volatile UINT64 reply_service_id;
+    volatile UINT64 reply_interface_id;
+    volatile UINT64 payload_addr;
+    volatile UINT32 payload_len;
+    volatile UINT32 flags;
 } ap_request_header_t;
 
 typedef struct {
@@ -63,5 +70,10 @@ typedef struct {
     ap_reply_header_t reply;
     ap_request_metrics_t metrics;
 } ap_request_slot_t;
+
+void reset_ap_request_slot(ap_request_slot_t *slot);
+void prepare_ap_request_slot(ap_request_slot_t *slot, UINT32 target_cpu, UINT32 opcode,
+                             UINT64 service_id, UINT64 interface_id, UINT32 sequence);
+void copy_ap_request_slot(ap_request_slot_t *dst, const ap_request_slot_t *src);
 
 #endif

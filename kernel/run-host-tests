@@ -14,6 +14,7 @@ gcc \
   -Werror \
   -I"$script_dir" \
   -DVIBE_AP_REQUEST_FAULT_TEST=0 \
+  "$script_dir/ap_request.c" \
   "$script_dir/ap_services.c" \
   "$script_dir/tests/test_ap_services.c" \
   -o "$build_dir/test_ap_services"

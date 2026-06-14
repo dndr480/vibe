@@ -2059,26 +2059,6 @@ static void run_ap_fault_test_if_enabled(void) {
 #endif
 }
 
-static void reset_ap_request_slot(ap_request_slot_t *slot) {
-    slot->state = AP_REQUEST_STATUS_EMPTY;
-    slot->request.source_cpu = 0;
-    slot->request.target_cpu = 0;
-    slot->request.opcode = AP_REQUEST_OP_NONE;
-    slot->request.sequence = 0;
-    slot->request.service_id = 0;
-    slot->request.interface_id = 0;
-    slot->request.id_high = 0;
-    slot->request.id_low = 0;
-    slot->reply.result_code = 0;
-    slot->reply.fault_code = 0;
-    slot->reply.request_id_high = 0;
-    slot->reply.request_id_low = 0;
-    slot->reply.result_cs = 0;
-    slot->reply.result_tr = 0;
-    slot->metrics.handled_count = 0;
-    slot->metrics.wait_loops = 0;
-}
-
 static ap_request_slot_t *ap_inbox_slot(ap_context_t *ctx, UINTN slot_index) {
     return &ctx->request_slots[slot_index];
 }
@@ -2092,26 +2072,6 @@ static UINTN ap_inbox_slot_limit(UINTN count) {
 
 static void reset_ap_inbox_slot(ap_context_t *ctx, UINTN slot_index) {
     reset_ap_request_slot(ap_inbox_slot(ctx, slot_index));
-}
-
-static void copy_ap_request_slot(ap_request_slot_t *dst, ap_request_slot_t *src) {
-    dst->state = src->state;
-    dst->request.source_cpu = src->request.source_cpu;
-    dst->request.target_cpu = src->request.target_cpu;
-    dst->request.opcode = src->request.opcode;
-    dst->request.sequence = src->request.sequence;
-    dst->request.service_id = src->request.service_id;
-    dst->request.interface_id = src->request.interface_id;
-    dst->request.id_high = src->request.id_high;
-    dst->request.id_low = src->request.id_low;
-    dst->reply.result_code = src->reply.result_code;
-    dst->reply.fault_code = src->reply.fault_code;
-    dst->reply.request_id_high = src->reply.request_id_high;
-    dst->reply.request_id_low = src->reply.request_id_low;
-    dst->reply.result_cs = src->reply.result_cs;
-    dst->reply.result_tr = src->reply.result_tr;
-    dst->metrics.handled_count = src->metrics.handled_count;
-    dst->metrics.wait_loops = src->metrics.wait_loops;
 }
 
 static void reset_ap_request_history(ap_context_t *ctx) {
@@ -2355,27 +2315,14 @@ static void ap_request_loop(ap_context_t *ctx) {
     }
 }
 
-static void prepare_ap_request(ap_request_slot_t *slot, UINT32 target_cpu, UINT32 opcode,
-                               UINT64 service_id, UINT64 interface_id, UINT32 sequence) {
-    slot->metrics.handled_count = 0;
-    slot->request.source_cpu = 0;
-    slot->request.target_cpu = target_cpu;
-    slot->request.opcode = opcode;
-    slot->request.sequence = sequence;
-    slot->request.service_id = service_id;
-    slot->request.interface_id = interface_id;
-    slot->request.id_high = 0x41502d50494e4721ULL;
-    slot->request.id_low = sequence;
-}
-
 static void publish_ap_inbox_request(ap_context_t *ctx, UINTN slot_index, UINT32 opcode,
                                      UINT64 service_id, UINT64 interface_id, UINT32 sequence,
                                      int send_kick) {
     ap_boot_info_t *boot = &ctx->boot;
     ap_request_slot_t *slot = ap_inbox_slot(ctx, slot_index);
     reset_ap_inbox_slot(ctx, slot_index);
-    prepare_ap_request(slot, ap_context_index(ctx) + 1U, opcode, service_id,
-                       interface_id, sequence);
+    prepare_ap_request_slot(slot, ap_context_index(ctx) + 1U, opcode, service_id,
+                            interface_id, sequence);
     if (boot->ap_state == AP_BOOT_STATE_FAULTED) {
         slot->reply.fault_code = (UINT32)boot->fault_vector;
         slot->state = AP_REQUEST_STATUS_FAULT;
