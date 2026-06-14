@@ -650,6 +650,7 @@ typedef struct {
     volatile UINT32 request_ipi_send_fail_count;
     volatile UINT32 idle_halt_count;
     volatile UINT32 idle_wake_count;
+    volatile UINT32 completion_target_apic_id;
 } ap_context_t;
 
 typedef struct {
@@ -679,7 +680,6 @@ static uuid128_t current_request_uuid;
 static ap_context_t ap_contexts[1];
 static ap_interrupt_observe_t *ap0_interrupts __attribute__((used)) = &ap_contexts[0].interrupts;
 static volatile UINT64 ap_lapic_base;
-static volatile UINT32 ap_bsp_apic_id;
 static volatile UINT32 bsp_wait_halt_count;
 static volatile UINT32 bsp_wait_wake_count;
 static volatile UINT32 bsp_wait_timer_count;
@@ -1466,7 +1466,7 @@ static char *append_uuid128(char *p, uuid128_t uuid) {
 
 static void ap_notify_bsp_request_complete(ap_context_t *ctx) {
     UINT64 base = ap_lapic_base;
-    UINT32 apic_id = ap_bsp_apic_id;
+    UINT32 apic_id = ctx->completion_target_apic_id;
     ap_boot_info_t *boot = &ctx->boot;
     if (base == 0) {
         return;
@@ -3983,9 +3983,9 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE image, EFI_SYSTEM_TABLE *st) {
     ap0->request_ipi_send_fail_count = 0;
     ap0->idle_halt_count = 0;
     ap0->idle_wake_count = 0;
+    ap0->completion_target_apic_id = acpi.bsp_apic_id;
     zero_memory(&ap0->interrupts, sizeof(ap0->interrupts));
     ap_lapic_base = acpi.local_apic_base;
-    ap_bsp_apic_id = acpi.bsp_apic_id;
     bsp_wait_halt_count = 0;
     bsp_wait_wake_count = 0;
     bsp_wait_timer_count = 0;
