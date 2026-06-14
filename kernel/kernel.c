@@ -687,7 +687,6 @@ typedef struct {
 
 static idt_entry_t idt[256];
 static cpu_local_t cpu0;
-static cpu_local_t *current_cpu = &cpu0;
 static bsp_interrupt_observe_t bsp_interrupt_observe;
 static system_interrupt_observe_t system_interrupt_observe;
 static framebuffer_t kernel_framebuffer;
@@ -1548,7 +1547,7 @@ void fault_dispatch(fault_frame_t *frame) {
     append_hex64(p, read_cr3());
     draw_line(fb, 48, &y, line, kernel_fg, kernel_bg, 2);
 
-    cpu_local_t *cpu = current_cpu;
+    cpu_local_t *cpu = &cpu0;
     p = append_str(line, "CPU: ");
     p = append_dec(p, cpu ? cpu->id : 0);
     p = append_str(p, "  TR: ");
@@ -1695,7 +1694,6 @@ static void init_cpu_local(cpu_local_t *cpu, UINT32 id) {
 static void load_cpu_tables(cpu_local_t *cpu);
 
 static void install_cpu_tables(cpu_local_t *cpu) {
-    current_cpu = cpu;
     load_cpu_tables(cpu);
 }
 
