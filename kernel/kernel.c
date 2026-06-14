@@ -197,6 +197,13 @@ enum {
     AP_REQUEST_OP_COUNTER = 2,
 };
 
+enum {
+    AP_QUEUE_STOP_NONE = 0,
+    AP_QUEUE_STOP_DRAINED = 1,
+    AP_QUEUE_STOP_BAD_OP = 2,
+    AP_QUEUE_STOP_FAULT = 3,
+};
+
 static UINT32 color(framebuffer_t *fb, UINT8 r, UINT8 g, UINT8 b) {
     if (fb->format == PixelRedGreenBlueReserved8BitPerColor) {
         return ((UINT32)b << 16) | ((UINT32)g << 8) | r;
@@ -493,6 +500,14 @@ typedef struct {
 } ap_request_snapshot_t;
 
 typedef struct {
+    volatile UINT32 current_slot;
+    volatile UINT32 handled_count;
+    volatile UINT32 last_slot;
+    volatile UINT32 last_state;
+    volatile UINT32 stop_reason;
+} ap_queue_summary_t;
+
+typedef struct {
     volatile UINT32 vector;
     volatile UINT32 count;
     volatile UINT64 rip;
@@ -528,6 +543,7 @@ static uuid128_t current_request_uuid;
 static ap_boot_info_t ap_boot;
 static ap_request_slot_t ap_request_slots[AP_REQUEST_SLOT_COUNT];
 static ap_request_snapshot_t ap_request_snapshots[AP_REQUEST_SNAPSHOT_COUNT];
+static ap_queue_summary_t ap_queue_summary;
 static volatile UINT32 ap_current_request_slot;
 static volatile UINT32 ap_request_handled_count;
 static volatile UINT32 ap_counter_value;
@@ -1313,6 +1329,11 @@ void ap_fault_dispatch(fault_frame_t *frame) {
         slot->reply.fault_code = (UINT32)frame->vector;
     }
     if (slot) {
+        ap_queue_summary.current_slot = slot_index + 1U;
+        ap_queue_summary.last_slot = slot_index + 1U;
+        ap_queue_summary.last_state = AP_REQUEST_STATUS_FAULT;
+        ap_queue_summary.stop_reason = AP_QUEUE_STOP_FAULT;
+        __asm__ __volatile__("mfence" : : : "memory");
         if (!cmpxchg_u32(&slot->state, AP_REQUEST_STATUS_PENDING, AP_REQUEST_STATUS_FAULT)) {
             if (!cmpxchg_u32(&slot->state, AP_REQUEST_STATUS_RUNNING, AP_REQUEST_STATUS_FAULT)) {
                 if (slot->state == AP_REQUEST_STATUS_EMPTY) {
@@ -1650,6 +1671,43 @@ static int ap_request_state_finished(UINT32 state) {
            state == AP_REQUEST_STATUS_SKIPPED;
 }
 
+static void reset_ap_queue_summary(void) {
+    ap_queue_summary.current_slot = 0;
+    ap_queue_summary.handled_count = 0;
+    ap_queue_summary.last_slot = 0;
+    ap_queue_summary.last_state = AP_REQUEST_STATUS_EMPTY;
+    ap_queue_summary.stop_reason = AP_QUEUE_STOP_NONE;
+}
+
+static int ap_queue_all_other_slots_done(UINTN current_slot) {
+    for (UINTN i = 0; i < AP_REQUEST_SLOT_COUNT; i++) {
+        if (i == current_slot) {
+            continue;
+        }
+        if (ap_request_slots[i].state != AP_REQUEST_STATUS_DONE) {
+            return 0;
+        }
+    }
+    return 1;
+}
+
+static void ap_queue_note_slot_start(UINTN slot_index) {
+    ap_queue_summary.current_slot = (UINT32)(slot_index + 1);
+    ap_queue_summary.stop_reason = AP_QUEUE_STOP_NONE;
+}
+
+static void ap_queue_note_slot_terminal(UINTN slot_index, UINT32 state, UINT32 stop_reason) {
+    ap_queue_summary.current_slot = 0;
+    ap_queue_summary.handled_count = ap_queue_summary.handled_count + 1U;
+    ap_queue_summary.last_slot = (UINT32)(slot_index + 1);
+    ap_queue_summary.last_state = state;
+    if (stop_reason == AP_QUEUE_STOP_NONE && ap_queue_all_other_slots_done(slot_index)) {
+        stop_reason = AP_QUEUE_STOP_DRAINED;
+    }
+    ap_queue_summary.stop_reason = stop_reason;
+    __asm__ __volatile__("mfence" : : : "memory");
+}
+
 static void begin_ap_reply(ap_request_slot_t *slot) {
     slot->reply.request_id_high = slot->request.id_high;
     slot->reply.request_id_low = slot->request.id_low;
@@ -1739,6 +1797,7 @@ static void ap_request_loop(void) {
             }
 
             ap_current_request_slot = (UINT32)i;
+            ap_queue_note_slot_start(i);
             slot->metrics.handled_count = ap_request_handled_count;
             begin_ap_reply(slot);
             ap_boot.entry_state = AP_ENTRY_STATE_REQUEST;
@@ -1750,6 +1809,7 @@ static void ap_request_loop(void) {
                 handler(slot);
                 ap_boot.ap_state = AP_BOOT_STATE_ONLINE;
                 ap_boot.entry_state = AP_ENTRY_STATE_LOOP;
+                ap_queue_note_slot_terminal(i, AP_REQUEST_STATUS_DONE, AP_QUEUE_STOP_NONE);
                 complete_ap_request(slot, AP_REQUEST_STATUS_DONE);
                 ap_current_request_slot = AP_REQUEST_NO_SLOT;
             } else {
@@ -1758,6 +1818,7 @@ static void ap_request_loop(void) {
                 slot->reply.fault_code = 0;
                 ap_boot.ap_state = AP_BOOT_STATE_HALTED;
                 ap_boot.entry_state = AP_ENTRY_STATE_HALTED;
+                ap_queue_note_slot_terminal(i, AP_REQUEST_STATUS_BAD_OP, AP_QUEUE_STOP_BAD_OP);
                 complete_ap_request(slot, AP_REQUEST_STATUS_BAD_OP);
                 ap_current_request_slot = AP_REQUEST_NO_SLOT;
                 for (;;) {
@@ -2634,6 +2695,16 @@ static const char *ap_request_op_name(UINT32 opcode) {
     }
 }
 
+static const char *ap_queue_stop_reason_name(UINT32 reason) {
+    switch (reason) {
+    case AP_QUEUE_STOP_NONE: return "NONE";
+    case AP_QUEUE_STOP_DRAINED: return "DRAINED";
+    case AP_QUEUE_STOP_BAD_OP: return "BAD-OP";
+    case AP_QUEUE_STOP_FAULT: return "FAULT";
+    default: return "UNKNOWN";
+    }
+}
+
 static int ap_request_result_ok(ap_request_slot_t *request, UINT32 counter_value) {
     if (request->state != AP_REQUEST_STATUS_DONE ||
         request->reply.fault_code != 0 ||
@@ -2744,6 +2815,34 @@ static void draw_ap_boot_info(framebuffer_t *fb, UINT32 *y, ap_boot_info_t *boot
             draw_line(fb, 48, y, line, warn, bg, 2);
         }
     }
+}
+
+static void draw_ap_queue_summary(framebuffer_t *fb, UINT32 *y, ap_queue_summary_t *queue,
+                                  UINT32 fg, UINT32 accent, UINT32 warn, UINT32 bg) {
+    char line[192];
+    char *p = append_str(line, "AP QUEUE: HANDLED ");
+    p = append_dec(p, queue->handled_count);
+    *p++ = '/';
+    *p = 0;
+    p = append_dec(p, AP_REQUEST_SLOT_COUNT);
+    p = append_str(p, "  LAST: ");
+    p = append_dec(p, queue->last_slot);
+    *p++ = ' ';
+    *p = 0;
+    p = append_str(p, ap_request_state_name(queue->last_state));
+    p = append_str(p, "  STOP: ");
+    p = append_str(p, ap_queue_stop_reason_name(queue->stop_reason));
+    p = append_str(p, "  CURRENT: ");
+    append_dec(p, queue->current_slot);
+
+    UINT32 color = fg;
+    if (queue->stop_reason == AP_QUEUE_STOP_DRAINED) {
+        color = accent;
+    } else if (queue->stop_reason == AP_QUEUE_STOP_BAD_OP ||
+               queue->stop_reason == AP_QUEUE_STOP_FAULT) {
+        color = warn;
+    }
+    draw_line(fb, 48, y, line, color, bg, 2);
 }
 
 static void draw_ap_request_info(framebuffer_t *fb, UINT32 *y, ap_request_slot_t *request,
@@ -2944,6 +3043,7 @@ static void draw_memory_map(framebuffer_t *fb, efi_memory_map_t *map, paging_inf
 
     if (ap) {
         draw_ap_boot_info(fb, &y, ap, fg, accent, warn, bg);
+        draw_ap_queue_summary(fb, &y, &ap_queue_summary, fg, accent, warn, bg);
         if (request_snapshots) {
             draw_ap_request_snapshots(fb, &y, request_snapshots, request_snapshot_count,
                                       fg, accent, warn, bg);
@@ -3243,6 +3343,7 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE image, EFI_SYSTEM_TABLE *st) {
         reset_ap_request_slot(&ap_request_slots[i]);
     }
     reset_ap_request_snapshots();
+    reset_ap_queue_summary();
     ap_current_request_slot = AP_REQUEST_NO_SLOT;
     ap_request_handled_count = 0;
     ap_counter_value = 0;
