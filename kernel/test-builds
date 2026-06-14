@@ -24,6 +24,9 @@ run_variant() {
 run_variant default
 run_variant target-ap1 -DVIBE_AP_REQUEST_TARGET_INDEX=1
 run_variant target-ap2 -DVIBE_AP_REQUEST_TARGET_INDEX=2
+run_variant owner-ap1 \
+  -DVIBE_AP_PING_SERVICE_OWNER_INDEX=1 \
+  -DVIBE_AP_COUNTER_SERVICE_OWNER_INDEX=1
 run_variant ap-ud2 -DVIBE_AP_REQUEST_FAULT_TEST=1
 run_variant hang-short-timeout \
   -DVIBE_AP_REQUEST_FAULT_TEST=2 \

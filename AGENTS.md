@@ -32,6 +32,7 @@
 - For AP request, AP context, routing, scheduler, broadcast, IPI, LAPIC, timer, queue, or service changes, run the relevant PXE scenarios:
   - default scheduler PXE
   - explicit target AP1/AP2 PXE when routing or target selection is affected
+  - owner AP1 PXE when service-owner routing or service registry owner data is affected
   - AP UD2 smoke when fault handling, service dispatch, or completion paths are affected
   - HANG short-timeout when timeout, wait, idle, or stopped paths are affected
 - For BSP fault display or BSP CPU/IDT paths, run BSP UD2 smoke.
@@ -49,6 +50,7 @@
   - HANG short-timeout: the screen returns, history contains `TIMEOUT`, completion does not falsely increase, and no later refill/publish/kick appears.
   - BSP UD2: `BSP FAULT`, `CURRENT REQUEST: N/A`, `CPU: 0`, `TSS: READY`, and TR/loaded TR look sane.
   - unknown-third and unknown-seventh: history shows BAD_OP at the intended request, later slots are skipped or absent, and no further refill/publish/kick occurs.
+- When running `pxenode1/run-owner-ap1-smoke`, verify `AP SCHED: RR`, `AP ROUTE: OWNER TARGET: 2/4 OWNER: 2`, broadcast PING OK, stream `HANDLED 8/8`, completion/kick `FAIL=0`, and AP queue/history lines come from the AP1 owner target.
 - A repo-local skill may be used as the visual review checklist for PXE screenshots. In that model, the skill should first direct the agent to run the relevant script, then inspect the produced screenshots and summarize the observed lines.
 - Keep executable test logic in scripts where possible. Use skills for orchestration guidance and visual interpretation, not as a replacement for runnable tests with exit codes.
 - If a script is added for a PXE scenario, update this workflow or the repo-local skill so future agents know when to run it and what screen lines to verify.

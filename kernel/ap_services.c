@@ -1,7 +1,5 @@
 #include "ap_services.h"
 
-#define AP_SERVICE_OWNER_AP0_CONTEXT_INDEX 0U
-
 static UINT16 read_cs(void) {
     UINT16 cs;
     __asm__ __volatile__("movw %%cs, %0" : "=r"(cs));
@@ -58,9 +56,9 @@ static void ap_handle_counter_increment(ap_service_context_t *ctx, ap_request_sl
 
 static const ap_service_registry_entry_t ap_service_registry[] = {
     {AP_REQUEST_SERVICE_PING, AP_REQUEST_INTERFACE_PING,
-     AP_SERVICE_OWNER_AP0_CONTEXT_INDEX, ap_handle_ping_request},
+     VIBE_AP_PING_SERVICE_OWNER_INDEX, ap_handle_ping_request},
     {AP_REQUEST_SERVICE_COUNTER, AP_REQUEST_INTERFACE_COUNTER_INCREMENT,
-     AP_SERVICE_OWNER_AP0_CONTEXT_INDEX, ap_handle_counter_increment},
+     VIBE_AP_COUNTER_SERVICE_OWNER_INDEX, ap_handle_counter_increment},
 };
 
 const ap_service_registry_entry_t *find_ap_service(UINT64 service_id, UINT64 interface_id) {
