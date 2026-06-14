@@ -633,6 +633,18 @@ _Static_assert(__builtin_offsetof(ap_interrupt_observe_t, idle_timer_count) == 6
                "AP idle timer count offset must match ISR writes");
 
 typedef struct {
+    volatile UINT32 halt_count;
+    volatile UINT32 wake_count;
+    volatile UINT32 timer_count;
+} bsp_wait_observe_t;
+_Static_assert(__builtin_offsetof(bsp_wait_observe_t, halt_count) == 0,
+               "BSP wait halt count offset must match C writes");
+_Static_assert(__builtin_offsetof(bsp_wait_observe_t, wake_count) == 4,
+               "BSP wait wake count offset must match C writes");
+_Static_assert(__builtin_offsetof(bsp_wait_observe_t, timer_count) == 8,
+               "BSP wait timer count offset must match ISR writes");
+
+typedef struct {
     ap_boot_info_t boot;
     UINT8 boot_stack[AP_BOOT_STACK_SIZE] __attribute__((aligned(16)));
     cpu_local_t cpu;
@@ -674,9 +686,7 @@ static UINT32 kernel_warn;
 static ap_context_t ap_contexts[1];
 static ap_interrupt_observe_t *ap0_interrupts __attribute__((used)) = &ap_contexts[0].interrupts;
 static volatile UINT64 ap_lapic_base;
-static volatile UINT32 bsp_wait_halt_count;
-static volatile UINT32 bsp_wait_wake_count;
-static volatile UINT32 bsp_wait_timer_count;
+static bsp_wait_observe_t bsp_wait_observe;
 
 static ap_context_t *ap0_context(void) {
     return &ap_contexts[0];
@@ -818,9 +828,9 @@ __asm__(
     ".global isr_bsp_wait_timer\n"
     "isr_bsp_wait_timer:\n"
     "    pushq %rax\n"
-    "    movl bsp_wait_timer_count(%rip), %eax\n"
+    "    movl bsp_wait_observe+8(%rip), %eax\n"
     "    addl $1, %eax\n"
-    "    movl %eax, bsp_wait_timer_count(%rip)\n"
+    "    movl %eax, bsp_wait_observe+8(%rip)\n"
     "    movq ap_lapic_base(%rip), %rax\n"
     "    testq %rax, %rax\n"
     "    jz 8f\n"
@@ -2145,18 +2155,18 @@ static int bsp_arm_wait_timer(void) {
 }
 
 static UINT32 bsp_wait_for_ap_request_event(void) {
-    UINT32 timer_count_before = bsp_wait_timer_count;
+    UINT32 timer_count_before = bsp_wait_observe.timer_count;
 
     if (!bsp_arm_wait_timer()) {
         __asm__ __volatile__("sti; nop; pause; cli" : : : "memory");
         return 1;
     }
 
-    bsp_wait_halt_count = bsp_wait_halt_count + 1U;
+    bsp_wait_observe.halt_count = bsp_wait_observe.halt_count + 1U;
     __asm__ __volatile__("sti; hlt; cli" : : : "memory");
     bsp_disarm_wait_timer();
-    bsp_wait_wake_count = bsp_wait_wake_count + 1U;
-    if (bsp_wait_timer_count != timer_count_before) {
+    bsp_wait_observe.wake_count = bsp_wait_observe.wake_count + 1U;
+    if (bsp_wait_observe.timer_count != timer_count_before) {
         return BSP_WAIT_TIMER_TIMEOUT_STEP;
     }
     return 1;
@@ -3464,13 +3474,13 @@ static void draw_ap_kick_summary(framebuffer_t *fb, UINT32 *y, ap_context_t *ctx
     draw_line(fb, 48, y, line, fg, bg, 2);
 
     p = append_str(line, "BSP WAIT: HALT/WAKE/TIMER: ");
-    p = append_dec(p, bsp_wait_halt_count);
+    p = append_dec(p, bsp_wait_observe.halt_count);
     *p++ = '/';
     *p = 0;
-    p = append_dec(p, bsp_wait_wake_count);
+    p = append_dec(p, bsp_wait_observe.wake_count);
     *p++ = '/';
     *p = 0;
-    append_dec(p, bsp_wait_timer_count);
+    append_dec(p, bsp_wait_observe.timer_count);
     draw_line(fb, 48, y, line, fg, bg, 2);
 }
 
@@ -3968,9 +3978,7 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE image, EFI_SYSTEM_TABLE *st) {
     ap0->completion_target_apic_id = acpi.bsp_apic_id;
     zero_memory(&ap0->interrupts, sizeof(ap0->interrupts));
     ap_lapic_base = acpi.local_apic_base;
-    bsp_wait_halt_count = 0;
-    bsp_wait_wake_count = 0;
-    bsp_wait_timer_count = 0;
+    zero_memory(&bsp_wait_observe, sizeof(bsp_wait_observe));
     spurious_interrupt_trace.vector = 0;
     spurious_interrupt_trace.count = 0;
     spurious_interrupt_trace.rip = 0;
