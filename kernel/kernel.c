@@ -661,11 +661,6 @@ typedef struct {
     UINT64 rflags;
 } fault_frame_t;
 
-typedef struct {
-    UINT64 high;
-    UINT64 low;
-} uuid128_t;
-
 static idt_entry_t idt[256];
 static cpu_local_t cpu0;
 static cpu_local_t *current_cpu = &cpu0;
@@ -676,7 +671,6 @@ static UINT32 kernel_bg;
 static UINT32 kernel_fg;
 static UINT32 kernel_accent;
 static UINT32 kernel_warn;
-static uuid128_t current_request_uuid;
 static ap_context_t ap_contexts[1];
 static ap_interrupt_observe_t *ap0_interrupts __attribute__((used)) = &ap_contexts[0].interrupts;
 static volatile UINT64 ap_lapic_base;
@@ -1457,13 +1451,6 @@ static const char *fault_vector_name(UINT64 vector) {
     }
 }
 
-static char *append_uuid128(char *p, uuid128_t uuid) {
-    p = append_hex64(p, uuid.high);
-    *p++ = '-';
-    *p = 0;
-    return append_hex64(p, uuid.low);
-}
-
 static void ap_notify_bsp_request_complete(ap_context_t *ctx) {
     UINT64 base = ap_lapic_base;
     UINT32 apic_id = ctx->completion_target_apic_id;
@@ -1556,9 +1543,7 @@ void fault_dispatch(fault_frame_t *frame) {
     append_hex64(p, cpu ? cpu->tss.ist[CPU_IST_DOUBLE_FAULT - 1] : 0);
     draw_line(fb, 48, &y, line, kernel_fg, kernel_bg, 2);
 
-    p = append_str(line, "CURRENT REQUEST: ");
-    append_uuid128(p, current_request_uuid);
-    draw_line(fb, 48, &y, line, kernel_accent, kernel_bg, 2);
+    draw_line(fb, 48, &y, "CURRENT REQUEST: N/A", kernel_accent, kernel_bg, 2);
 
     draw_line(fb, 48, &y, "HALTED", kernel_warn, kernel_bg, 2);
 
@@ -3953,9 +3938,6 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE image, EFI_SYSTEM_TABLE *st) {
     kernel_fg = fg;
     kernel_accent = accent;
     kernel_warn = warn;
-    current_request_uuid.high = 0;
-    current_request_uuid.low = 0;
-
     init_cpu_local(&cpu0, 0);
     install_cpu_tables(&cpu0);
     install_idt();
