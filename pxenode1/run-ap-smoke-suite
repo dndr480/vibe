@@ -1,0 +1,77 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+repo_dir="$(cd -- "$script_dir/.." && pwd)"
+stamp="$(date +%Y%m%d-%H%M%S)"
+output_dir="$script_dir/captures/ap-smoke-suite-$stamp"
+restore_needed=0
+
+usage() {
+  cat <<EOF
+Usage: $0 [--output-dir PATH]
+
+Run the AP PXE smoke scripts in sequence and save screenshots under one
+artifact directory. The script restores the default kernel EFI before exit.
+EOF
+}
+
+restore_default_efi() {
+  if [[ "$restore_needed" -eq 1 ]]; then
+    printf '==> restoring default kernel EFI\n'
+    KERNEL_CFLAGS_EXTRA= "$repo_dir/kernel/build-kernel-efi"
+  fi
+}
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --output-dir|-o)
+      if [[ $# -lt 2 ]]; then
+        printf 'error: %s requires a path\n' "$1" >&2
+        usage >&2
+        exit 2
+      fi
+      output_dir="${2:-}"
+      shift 2
+      ;;
+    --help|-h)
+      usage
+      exit 0
+      ;;
+    *)
+      printf 'error: unknown argument: %s\n' "$1" >&2
+      usage >&2
+      exit 2
+      ;;
+  esac
+done
+
+if [[ -z "$output_dir" ]]; then
+  printf 'error: --output-dir must not be empty\n' >&2
+  exit 2
+fi
+
+mkdir -p "$output_dir"
+restore_needed=1
+trap restore_default_efi EXIT
+
+run_smoke() {
+  local name="$1"
+  local script="$2"
+  local output="$output_dir/$name.jpg"
+
+  printf '\n==> running %s\n' "$name"
+  "$script_dir/$script" --output "$output"
+  printf 'SUITE_SCREENSHOT[%s]=%s\n' "$name" "$output"
+}
+
+run_smoke default-scheduler run-default-scheduler-smoke
+run_smoke ap1-target run-ap1-target-smoke
+run_smoke ap2-target run-ap2-target-smoke
+run_smoke ap-ud2 run-ap-ud2-smoke
+run_smoke hang-short-timeout run-hang-short-timeout-smoke
+run_smoke bsp-ud2 run-bsp-ud2-smoke
+run_smoke unknown-third run-unknown-third-smoke
+run_smoke unknown-seventh run-unknown-seventh-smoke
+
+printf '\nSUITE_OUTPUT_DIR=%s\n' "$output_dir"
