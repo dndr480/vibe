@@ -587,6 +587,7 @@ typedef struct {
     volatile UINT32 last_slot;
     volatile UINT32 last_state;
     volatile UINT32 stop_reason;
+    volatile UINT32 planned_count;
 } ap_queue_summary_t;
 
 typedef struct {
@@ -1801,19 +1802,6 @@ static void snapshot_ap_request(UINTN index, ap_request_slot_t *slot, UINT32 cou
     __asm__ __volatile__("mfence" : : : "memory");
 }
 
-static void snapshot_ap_requests(ap_request_slot_t *slots, UINTN count, UINT32 counter_base) {
-    UINT32 counter_value = counter_base;
-
-    for (UINTN i = 0; i < count && i < AP_REQUEST_SNAPSHOT_COUNT; i++) {
-        if (ap_request_is_counter_increment(&slots[i]) &&
-            slots[i].state == AP_REQUEST_STATUS_DONE &&
-            slots[i].reply.fault_code == 0) {
-            counter_value++;
-        }
-        snapshot_ap_request(i, &slots[i], counter_value);
-    }
-}
-
 static int cmpxchg_u32(volatile UINT32 *ptr, UINT32 expected, UINT32 desired) {
     UINT8 success;
     __asm__ __volatile__(
@@ -1843,6 +1831,7 @@ static void reset_ap_queue_summary(void) {
     ap_queue_summary.last_slot = 0;
     ap_queue_summary.last_state = AP_REQUEST_STATUS_EMPTY;
     ap_queue_summary.stop_reason = AP_QUEUE_STOP_NONE;
+    ap_queue_summary.planned_count = AP_REQUEST_SLOT_COUNT;
 }
 
 static int ap_queue_all_other_slots_done(UINTN current_slot) {
@@ -1976,9 +1965,9 @@ static void ap_request_loop(void) {
                 ap_boot.ap_state = AP_BOOT_STATE_ONLINE;
                 ap_boot.entry_state = AP_ENTRY_STATE_LOOP;
                 ap_queue_note_slot_terminal(i, AP_REQUEST_STATUS_DONE, AP_QUEUE_STOP_NONE);
+                ap_current_request_slot = AP_REQUEST_NO_SLOT;
                 complete_ap_request(slot, AP_REQUEST_STATUS_DONE);
                 ap_notify_bsp_request_complete();
-                ap_current_request_slot = AP_REQUEST_NO_SLOT;
             } else {
                 slot->reply.result_code = ap_dispatch_miss_result_code(slot->request.service_id,
                                                                        slot->request.interface_id);
@@ -1986,9 +1975,9 @@ static void ap_request_loop(void) {
                 ap_boot.ap_state = AP_BOOT_STATE_HALTED;
                 ap_boot.entry_state = AP_ENTRY_STATE_HALTED;
                 ap_queue_note_slot_terminal(i, AP_REQUEST_STATUS_BAD_OP, AP_QUEUE_STOP_BAD_OP);
+                ap_current_request_slot = AP_REQUEST_NO_SLOT;
                 complete_ap_request(slot, AP_REQUEST_STATUS_BAD_OP);
                 ap_notify_bsp_request_complete();
-                ap_current_request_slot = AP_REQUEST_NO_SLOT;
                 for (;;) {
                     __asm__ __volatile__("cli; hlt" : : : "memory");
                 }
@@ -2034,17 +2023,7 @@ static void publish_ap_request(ap_request_slot_t *slot, ap_boot_info_t *boot, UI
     slot->state = AP_REQUEST_STATUS_PENDING;
 }
 
-static void publish_ap_request_batch(ap_request_slot_t *slots, UINTN slot_count,
-                                     ap_boot_info_t *boot, const ap_request_plan_t *plan,
-                                     UINTN plan_count) {
-    UINTN count = slot_count < plan_count ? slot_count : plan_count;
-    for (UINTN i = 0; i < count; i++) {
-        publish_ap_request(&slots[i], boot, plan[i].opcode, plan[i].service_id,
-                           plan[i].interface_id, plan[i].sequence);
-    }
-}
-
-static int ap_request_batch_done(ap_request_slot_t *slots, UINTN count) {
+static int ap_request_all_done(ap_request_slot_t *slots, UINTN count) {
     if (count > AP_REQUEST_SLOT_COUNT) {
         count = AP_REQUEST_SLOT_COUNT;
     }
@@ -2062,94 +2041,177 @@ static void drain_ap_request_ipis(void) {
     }
 }
 
-static void wait_for_ap_requests(ap_request_slot_t *slots, UINTN count, ap_boot_info_t *boot) {
-    UINT8 wait_recorded[AP_REQUEST_SLOT_COUNT];
-    UINT64 rflags = read_rflags();
+static UINTN ap_request_slot_limit(UINTN count) {
     if (count > AP_REQUEST_SLOT_COUNT) {
-        count = AP_REQUEST_SLOT_COUNT;
+        return AP_REQUEST_SLOT_COUNT;
     }
+    return count;
+}
+
+static void snapshot_ap_stream_slot(UINTN slot_index, ap_request_slot_t *slot,
+                                    UINT32 *counter_value) {
+    if (ap_request_is_counter_increment(slot) &&
+        slot->state == AP_REQUEST_STATUS_DONE &&
+        slot->reply.fault_code == 0) {
+        *counter_value = *counter_value + 1U;
+    }
+    snapshot_ap_request(slot_index, slot, *counter_value);
+}
+
+static void publish_ap_stream_slot(ap_request_slot_t *slots, UINT8 *active,
+                                   UINTN slot_index, ap_boot_info_t *boot,
+                                   const ap_request_plan_t *plan) {
+    publish_ap_request(&slots[slot_index], boot, plan->opcode, plan->service_id,
+                       plan->interface_id, plan->sequence);
+    active[slot_index] = 1;
+}
+
+static void stop_ap_request_stream(ap_request_slot_t *slots, UINTN count, UINT8 *active,
+                                   ap_boot_info_t *boot, UINT32 wait_loops) {
+    for (UINTN slot_index = 0; slot_index < count; slot_index++) {
+        if (!active[slot_index]) {
+            continue;
+        }
+
+        ap_request_slot_t *slot = &slots[slot_index];
+        UINT32 state = slot->state;
+        if (ap_request_state_finished(state)) {
+            continue;
+        }
+
+        slot->metrics.wait_loops = wait_loops;
+        if (boot->ap_state == AP_BOOT_STATE_FAULTED && state == AP_REQUEST_STATUS_RUNNING) {
+            slot->reply.fault_code = (UINT32)boot->fault_vector;
+            slot->state = AP_REQUEST_STATUS_FAULT;
+        } else if (state == AP_REQUEST_STATUS_PENDING) {
+            slot->state = AP_REQUEST_STATUS_SKIPPED;
+        }
+    }
+}
+
+static UINT32 active_ap_request_slot_count(UINT8 *active, UINTN count) {
+    UINT32 active_count = 0;
+    for (UINTN slot_index = 0; slot_index < count; slot_index++) {
+        if (active[slot_index]) {
+            active_count++;
+        }
+    }
+    return active_count;
+}
+
+static int ap_request_stream_should_stop(ap_boot_info_t *boot) {
+    return boot->ap_state == AP_BOOT_STATE_FAULTED ||
+           boot->ap_state == AP_BOOT_STATE_HALTED;
+}
+
+static int finish_ap_stream_slot(ap_request_slot_t *slots, UINT8 *active, UINTN slot_index,
+                                 UINT32 wait_loops, UINT32 *counter_value,
+                                 UINTN *completed_count) {
+    ap_request_slot_t *slot = &slots[slot_index];
+    UINT32 state = slot->state;
+    if (!active[slot_index] || !ap_request_state_finished(state)) {
+        return 0;
+    }
+
+    slot->metrics.wait_loops = wait_loops;
+    snapshot_ap_stream_slot(slot_index, slot, counter_value);
+    active[slot_index] = 0;
+    *completed_count = *completed_count + 1U;
+    return state == AP_REQUEST_STATUS_DONE;
+}
+
+static void finish_timed_out_ap_stream_slots(ap_request_slot_t *slots, UINTN count,
+                                             UINT8 *active, UINT32 *counter_value,
+                                             UINTN *completed_count) {
+    for (UINTN slot_index = 0; slot_index < count; slot_index++) {
+        if (!active[slot_index]) {
+            continue;
+        }
+
+        ap_request_slot_t *slot = &slots[slot_index];
+        if (!ap_request_state_finished(slot->state)) {
+            slot->metrics.wait_loops = AP_REQUEST_TIMEOUT_LOOPS;
+            if (!cmpxchg_u32(&slot->state, AP_REQUEST_STATUS_PENDING, AP_REQUEST_STATUS_TIMEOUT)) {
+                (void)cmpxchg_u32(&slot->state, AP_REQUEST_STATUS_RUNNING, AP_REQUEST_STATUS_TIMEOUT);
+            }
+        }
+        (void)finish_ap_stream_slot(slots, active, slot_index, AP_REQUEST_TIMEOUT_LOOPS,
+                                    counter_value, completed_count);
+    }
+}
+
+static int run_ap_request_stream(ap_request_slot_t *slots, UINTN slot_count,
+                                 ap_boot_info_t *boot, const ap_request_plan_t *plan,
+                                 UINTN plan_count) {
+    UINT8 active[AP_REQUEST_SLOT_COUNT];
+    UINTN count = ap_request_slot_limit(slot_count);
+    UINTN next_plan = 0;
+    UINTN completed_count = 0;
+    UINT32 counter_base = ap_counter_value;
+    UINT64 rflags = read_rflags();
+    int stopped = 0;
+
+    if (count == 0) {
+        return plan_count == 0;
+    }
+
+    reset_ap_queue_summary();
+    reset_ap_request_snapshots();
+    ap_queue_summary.planned_count = (UINT32)plan_count;
     for (UINTN i = 0; i < AP_REQUEST_SLOT_COUNT; i++) {
-        wait_recorded[i] = 0;
+        active[i] = 0;
+        reset_ap_request_slot(&slots[i]);
+    }
+
+    for (UINTN slot_index = 0; slot_index < count && next_plan < plan_count; slot_index++) {
+        publish_ap_stream_slot(slots, active, slot_index, boot, &plan[next_plan]);
+        next_plan++;
     }
 
     __asm__ __volatile__("sti" : : : "memory");
-    for (UINT32 i = 0; i < AP_REQUEST_TIMEOUT_LOOPS; i++) {
-        UINT32 all_finished = 1;
+    for (UINT32 wait_loops = 0; wait_loops < AP_REQUEST_TIMEOUT_LOOPS; wait_loops++) {
+        if (ap_request_stream_should_stop(boot)) {
+            stopped = 1;
+            stop_ap_request_stream(slots, count, active, boot, wait_loops);
+        }
 
         for (UINTN slot_index = 0; slot_index < count; slot_index++) {
-            ap_request_slot_t *slot = &slots[slot_index];
-            UINT32 state = slot->state;
-            if (ap_request_state_finished(state) && !wait_recorded[slot_index]) {
-                slot->metrics.wait_loops = i;
-                wait_recorded[slot_index] = 1;
+            if (!active[slot_index]) {
+                continue;
             }
-            if (!ap_request_state_finished(state)) {
-                all_finished = 0;
+            int done = finish_ap_stream_slot(slots, active, slot_index, wait_loops,
+                                             &counter_base, &completed_count);
+            if (!active[slot_index] && !done) {
+                stopped = 1;
             }
-        }
-
-        if (all_finished) {
-            break;
-        }
-
-        if (boot->ap_state == AP_BOOT_STATE_FAULTED) {
-            for (UINTN slot_index = 0; slot_index < count; slot_index++) {
-                ap_request_slot_t *slot = &slots[slot_index];
-                UINT32 state = slot->state;
-                if (state == AP_REQUEST_STATUS_RUNNING) {
-                    slot->metrics.wait_loops = i;
-                    wait_recorded[slot_index] = 1;
-                    slot->reply.fault_code = (UINT32)boot->fault_vector;
-                    slot->state = AP_REQUEST_STATUS_FAULT;
-                } else if (state == AP_REQUEST_STATUS_PENDING) {
-                    slot->metrics.wait_loops = i;
-                    wait_recorded[slot_index] = 1;
-                    slot->state = AP_REQUEST_STATUS_SKIPPED;
-                }
-            }
-            break;
-        }
-
-        if (boot->ap_state == AP_BOOT_STATE_HALTED) {
-            for (UINTN slot_index = 0; slot_index < count; slot_index++) {
-                ap_request_slot_t *slot = &slots[slot_index];
-                if (slot->state == AP_REQUEST_STATUS_PENDING) {
-                    slot->metrics.wait_loops = i;
-                    wait_recorded[slot_index] = 1;
-                    slot->state = AP_REQUEST_STATUS_SKIPPED;
+            if (done && !stopped && next_plan < plan_count) {
+                if (ap_request_stream_should_stop(boot)) {
+                    stopped = 1;
+                } else {
+                    publish_ap_stream_slot(slots, active, slot_index, boot, &plan[next_plan]);
+                    next_plan++;
                 }
             }
         }
+
+        if (stopped) {
+            stop_ap_request_stream(slots, count, active, boot, wait_loops);
+        }
+        if ((next_plan >= plan_count || stopped) &&
+            active_ap_request_slot_count(active, count) == 0) {
+            break;
+        }
+
         __asm__ __volatile__("pause" : : : "memory");
     }
+
     drain_ap_request_ipis();
     if ((rflags & (1ULL << 9)) == 0) {
         __asm__ __volatile__("cli" : : : "memory");
     }
 
-    for (UINTN slot_index = 0; slot_index < count; slot_index++) {
-        ap_request_slot_t *slot = &slots[slot_index];
-        if (ap_request_state_finished(slot->state)) {
-            continue;
-        }
-        slot->metrics.wait_loops = AP_REQUEST_TIMEOUT_LOOPS;
-        if (!cmpxchg_u32(&slot->state, AP_REQUEST_STATUS_PENDING, AP_REQUEST_STATUS_TIMEOUT)) {
-            (void)cmpxchg_u32(&slot->state, AP_REQUEST_STATUS_RUNNING, AP_REQUEST_STATUS_TIMEOUT);
-        }
-    }
-}
-
-static int run_ap_request_batch(ap_request_slot_t *slots, UINTN slot_count,
-                                ap_boot_info_t *boot, const ap_request_plan_t *plan,
-                                UINTN plan_count) {
-    UINTN count = slot_count < plan_count ? slot_count : plan_count;
-    UINT32 counter_base = ap_counter_value;
-
-    reset_ap_queue_summary();
-    publish_ap_request_batch(slots, slot_count, boot, plan, plan_count);
-    wait_for_ap_requests(slots, count, boot);
-    snapshot_ap_requests(slots, count, counter_base);
-    return ap_request_batch_done(slots, count);
+    finish_timed_out_ap_stream_slots(slots, count, active, &counter_base, &completed_count);
+    return completed_count == plan_count && ap_request_all_done(slots, count);
 }
 
 static void ap_entry_one(void) __attribute__((noreturn));
@@ -3040,7 +3102,7 @@ static void draw_ap_queue_summary(framebuffer_t *fb, UINT32 *y, ap_queue_summary
     p = append_dec(p, queue->handled_count);
     *p++ = '/';
     *p = 0;
-    p = append_dec(p, AP_REQUEST_SLOT_COUNT);
+    p = append_dec(p, queue->planned_count ? queue->planned_count : AP_REQUEST_SLOT_COUNT);
     p = append_str(p, "  LAST: ");
     p = append_dec(p, queue->last_slot);
     *p++ = ' ';
@@ -3586,7 +3648,7 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE image, EFI_SYSTEM_TABLE *st) {
     ap_request_ipi_send_count = 0;
     ap_request_ipi_send_fail_count = 0;
     bring_up_one_ap(&ap_boot, &acpi, &memory_map, &paging);
-    const ap_request_plan_t ap_first_batch_plan[AP_REQUEST_SLOT_COUNT] = {
+    const ap_request_plan_t ap_request_plan[] = {
         {VIBE_AP_FIRST_REQUEST_OPCODE, VIBE_AP_FIRST_REQUEST_SERVICE_ID,
          VIBE_AP_FIRST_REQUEST_INTERFACE_ID, 1},
         {VIBE_AP_SECOND_REQUEST_OPCODE, VIBE_AP_SECOND_REQUEST_SERVICE_ID,
@@ -3595,8 +3657,6 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE image, EFI_SYSTEM_TABLE *st) {
          VIBE_AP_THIRD_REQUEST_INTERFACE_ID, 3},
         {VIBE_AP_FOURTH_REQUEST_OPCODE, VIBE_AP_FOURTH_REQUEST_SERVICE_ID,
          VIBE_AP_FOURTH_REQUEST_INTERFACE_ID, 4},
-    };
-    const ap_request_plan_t ap_second_batch_plan[AP_REQUEST_SLOT_COUNT] = {
         {VIBE_AP_SECOND_BATCH_FIRST_REQUEST_OPCODE, VIBE_AP_SECOND_BATCH_FIRST_REQUEST_SERVICE_ID,
          VIBE_AP_SECOND_BATCH_FIRST_REQUEST_INTERFACE_ID, 5},
         {VIBE_AP_SECOND_BATCH_SECOND_REQUEST_OPCODE, VIBE_AP_SECOND_BATCH_SECOND_REQUEST_SERVICE_ID,
@@ -3606,11 +3666,9 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE image, EFI_SYSTEM_TABLE *st) {
         {VIBE_AP_SECOND_BATCH_FOURTH_REQUEST_OPCODE, VIBE_AP_SECOND_BATCH_FOURTH_REQUEST_SERVICE_ID,
          VIBE_AP_SECOND_BATCH_FOURTH_REQUEST_INTERFACE_ID, 8},
     };
-    if (run_ap_request_batch(ap_request_slots, AP_REQUEST_SLOT_COUNT, &ap_boot,
-                             ap_first_batch_plan, AP_REQUEST_SLOT_COUNT)) {
-        (void)run_ap_request_batch(ap_request_slots, AP_REQUEST_SLOT_COUNT, &ap_boot,
-                                   ap_second_batch_plan, AP_REQUEST_SLOT_COUNT);
-    }
+    (void)run_ap_request_stream(ap_request_slots, AP_REQUEST_SLOT_COUNT, &ap_boot,
+                                ap_request_plan,
+                                sizeof(ap_request_plan) / sizeof(ap_request_plan[0]));
 
     clear_screen(&fb, bg);
     draw_memory_map(&fb, &memory_map, &paging, &acpi, &ap_boot,
