@@ -1835,7 +1835,8 @@ static void set_idt_gate_in(idt_entry_t *table, UINT32 vector, UINT64 addr, UINT
     table[vector].zero = 0;
 }
 
-static void set_idt_gate(UINT32 vector, UINT64 addr, UINT16 selector, UINT8 ist, UINT8 type_attr) {
+static void set_bsp_idt_gate(UINT32 vector, UINT64 addr, UINT16 selector, UINT8 ist,
+                             UINT8 type_attr) {
     set_idt_gate_in(bsp_idt, vector, addr, selector, ist, type_attr);
 }
 
@@ -1847,7 +1848,7 @@ static void load_idt_entries(idt_entry_t *table) {
     __asm__ __volatile__("cli; lidt %0" : : "m"(idtr) : "memory");
 }
 
-static void load_idt_table(void) {
+static void load_bsp_idt_table(void) {
     load_idt_entries(bsp_idt);
 }
 
@@ -1855,24 +1856,24 @@ static void store_idtr(descriptor_table_ptr_t *idtr) {
     __asm__ __volatile__("sidt %0" : "=m"(*idtr) : : "memory");
 }
 
-static void install_idt(void) {
+static void install_bsp_idt(void) {
     UINT16 cs = read_cs();
     UINT64 unhandled_addr = isr_unhandled_addr();
 
     for (UINT32 vector = 0; vector < 256; vector++) {
-        set_idt_gate(vector, unhandled_addr, cs, 0, 0x8e);
+        set_bsp_idt_gate(vector, unhandled_addr, cs, 0, 0x8e);
     }
-    set_idt_gate(3, isr_breakpoint_addr(), cs, 0, 0xef);
-    set_idt_gate(6, isr_fault_ud_addr(), cs, CPU_IST_FAULT, 0x8e);
-    set_idt_gate(8, isr_fault_df_addr(), cs, CPU_IST_DOUBLE_FAULT, 0x8e);
-    set_idt_gate(13, isr_fault_gp_addr(), cs, CPU_IST_FAULT, 0x8e);
-    set_idt_gate(14, isr_fault_pf_addr(), cs, CPU_IST_FAULT, 0x8e);
-    set_idt_gate(AP_REQUEST_KICK_IPI_VECTOR, isr_ap_request_kick_ipi_addr(), cs, 0, 0x8e);
-    set_idt_gate(AP_REQUEST_IPI_VECTOR, isr_ap_request_ipi_addr(), cs, 0, 0x8e);
-    set_idt_gate(BSP_WAIT_TIMER_VECTOR, isr_bsp_wait_timer_addr(), cs, 0, 0x8e);
-    set_idt_gate(LAPIC_SPURIOUS_VECTOR, isr_spurious_interrupt_addr(), cs, 0, 0x8e);
+    set_bsp_idt_gate(3, isr_breakpoint_addr(), cs, 0, 0xef);
+    set_bsp_idt_gate(6, isr_fault_ud_addr(), cs, CPU_IST_FAULT, 0x8e);
+    set_bsp_idt_gate(8, isr_fault_df_addr(), cs, CPU_IST_DOUBLE_FAULT, 0x8e);
+    set_bsp_idt_gate(13, isr_fault_gp_addr(), cs, CPU_IST_FAULT, 0x8e);
+    set_bsp_idt_gate(14, isr_fault_pf_addr(), cs, CPU_IST_FAULT, 0x8e);
+    set_bsp_idt_gate(AP_REQUEST_KICK_IPI_VECTOR, isr_ap_request_kick_ipi_addr(), cs, 0, 0x8e);
+    set_bsp_idt_gate(AP_REQUEST_IPI_VECTOR, isr_ap_request_ipi_addr(), cs, 0, 0x8e);
+    set_bsp_idt_gate(BSP_WAIT_TIMER_VECTOR, isr_bsp_wait_timer_addr(), cs, 0, 0x8e);
+    set_bsp_idt_gate(LAPIC_SPURIOUS_VECTOR, isr_spurious_interrupt_addr(), cs, 0, 0x8e);
 
-    load_idt_table();
+    load_bsp_idt_table();
 }
 
 static void init_ap_idt(ap_context_t *ctx) {
@@ -3961,7 +3962,7 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE image, EFI_SYSTEM_TABLE *st) {
     kernel_warn = warn;
     init_cpu_local(&cpu0, 0);
     install_cpu_tables(&cpu0);
-    install_idt();
+    install_bsp_idt();
 
     paging_info_t paging;
     if (!setup_kernel_paging(&memory_map, &fb, &paging)) {
