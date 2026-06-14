@@ -1,5 +1,6 @@
 #include "efi.h"
 #include "ap_request.h"
+#include "ap_services.h"
 
 typedef struct {
     UINT32 *base;
@@ -58,10 +59,6 @@ typedef struct {
 #define VIBE_AP_FAULT_TEST_NONE 0
 #define VIBE_AP_FAULT_TEST_UD2 1
 #define VIBE_AP_FAULT_TEST_PF 2
-
-#ifndef VIBE_AP_REQUEST_FAULT_TEST
-#define VIBE_AP_REQUEST_FAULT_TEST 0
-#endif
 
 #ifndef VIBE_AP_FIRST_REQUEST_OPCODE
 #define VIBE_AP_FIRST_REQUEST_OPCODE AP_REQUEST_OP_PING
@@ -158,10 +155,6 @@ typedef struct {
 #ifndef VIBE_AP_SECOND_BATCH_FOURTH_REQUEST_INTERFACE_ID
 #define VIBE_AP_SECOND_BATCH_FOURTH_REQUEST_INTERFACE_ID AP_REQUEST_INTERFACE_PING
 #endif
-
-#define VIBE_AP_REQUEST_FAULT_TEST_NONE 0
-#define VIBE_AP_REQUEST_FAULT_TEST_UD2 1
-#define VIBE_AP_REQUEST_FAULT_TEST_HANG 2
 
 #define KERNEL_CODE_SELECTOR 0x08
 #define KERNEL_DATA_SELECTOR 0x10
@@ -1998,77 +1991,6 @@ static void complete_ap_request(ap_request_slot_t *slot, UINT32 state) {
     __asm__ __volatile__("mfence" : : : "memory");
 }
 
-static void run_ap_request_test_hook(int hang_enabled) {
-#if VIBE_AP_REQUEST_FAULT_TEST == VIBE_AP_REQUEST_FAULT_TEST_UD2
-    (void)hang_enabled;
-    __asm__ __volatile__("ud2" : : : "memory");
-#elif VIBE_AP_REQUEST_FAULT_TEST == VIBE_AP_REQUEST_FAULT_TEST_HANG
-    if (!hang_enabled) {
-        return;
-    }
-
-    __asm__ __volatile__("cli" : : : "memory");
-    for (;;) {
-        __asm__ __volatile__("pause" : : : "memory");
-    }
-#else
-    (void)hang_enabled;
-#endif
-}
-
-static void ap_handle_ping_request(ap_context_t *ctx, ap_request_slot_t *slot) {
-    run_ap_request_test_hook(1);
-    slot->reply.result_cs = read_cs();
-    slot->reply.result_tr = read_tr();
-    slot->reply.result_code = 0;
-    slot->reply.fault_code = 0;
-    ctx->request_handled_count = ctx->request_handled_count + 1U;
-    slot->metrics.handled_count = ctx->request_handled_count;
-}
-
-static void ap_handle_counter_increment(ap_context_t *ctx, ap_request_slot_t *slot) {
-    run_ap_request_test_hook(0);
-    ctx->counter_value = ctx->counter_value + 1U;
-    slot->reply.result_cs = read_cs();
-    slot->reply.result_tr = read_tr();
-    slot->reply.result_code = ctx->counter_value;
-    slot->reply.fault_code = 0;
-    ctx->request_handled_count = ctx->request_handled_count + 1U;
-    slot->metrics.handled_count = ctx->request_handled_count;
-}
-
-typedef void (*ap_request_handler_t)(ap_context_t *ctx, ap_request_slot_t *slot);
-
-typedef struct {
-    UINT64 service_id;
-    UINT64 interface_id;
-    ap_request_handler_t handler;
-} ap_request_dispatch_entry_t;
-
-static const ap_request_dispatch_entry_t ap_request_dispatch_table[] = {
-    {AP_REQUEST_SERVICE_PING, AP_REQUEST_INTERFACE_PING, ap_handle_ping_request},
-    {AP_REQUEST_SERVICE_COUNTER, AP_REQUEST_INTERFACE_COUNTER_INCREMENT, ap_handle_counter_increment},
-};
-
-static ap_request_handler_t find_ap_request_handler(UINT64 service_id, UINT64 interface_id) {
-    for (UINTN i = 0; i < sizeof(ap_request_dispatch_table) / sizeof(ap_request_dispatch_table[0]); i++) {
-        if (ap_request_dispatch_table[i].service_id == service_id &&
-            ap_request_dispatch_table[i].interface_id == interface_id) {
-            return ap_request_dispatch_table[i].handler;
-        }
-    }
-    return 0;
-}
-
-static UINT32 ap_dispatch_miss_result_code(UINT64 service_id, UINT64 interface_id) {
-    for (UINTN i = 0; i < sizeof(ap_request_dispatch_table) / sizeof(ap_request_dispatch_table[0]); i++) {
-        if (ap_request_dispatch_table[i].service_id == service_id) {
-            return (UINT32)interface_id;
-        }
-    }
-    return (UINT32)service_id;
-}
-
 static void ap_disarm_idle_timer(void) {
     UINT64 base = system_lapic_base;
     if (base == 0) {
@@ -2136,6 +2058,10 @@ static void ap_request_loop(void) __attribute__((noreturn));
 static void ap_request_loop(void) {
     ap_context_t *ctx = ap0_context();
     ap_boot_info_t *boot = &ctx->boot;
+    ap_service_context_t service_context = {
+        &ctx->request_handled_count,
+        &ctx->counter_value,
+    };
 
     boot->ap_state = AP_BOOT_STATE_ONLINE;
     boot->entry_state = AP_ENTRY_STATE_LOOP;
@@ -2166,7 +2092,7 @@ static void ap_request_loop(void) {
             ap_request_handler_t handler = find_ap_request_handler(slot->request.service_id,
                                                                    slot->request.interface_id);
             if (handler) {
-                handler(ctx, slot);
+                handler(&service_context, slot);
                 boot->ap_state = AP_BOOT_STATE_ONLINE;
                 boot->entry_state = AP_ENTRY_STATE_LOOP;
                 ap_queue_note_slot_terminal(ctx, i, AP_REQUEST_STATUS_DONE, AP_QUEUE_STOP_NONE);
