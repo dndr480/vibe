@@ -1,10 +1,6 @@
 #include "ap_services.h"
 
-typedef struct {
-    UINT64 service_id;
-    UINT64 interface_id;
-    ap_request_handler_t handler;
-} ap_request_dispatch_entry_t;
+#define AP_SERVICE_OWNER_AP0_CONTEXT_INDEX 0U
 
 static UINT16 read_cs(void) {
     UINT16 cs;
@@ -60,26 +56,49 @@ static void ap_handle_counter_increment(ap_service_context_t *ctx, ap_request_sl
     slot->metrics.handled_count = note_ap_request_handled(ctx);
 }
 
-static const ap_request_dispatch_entry_t ap_request_dispatch_table[] = {
-    {AP_REQUEST_SERVICE_PING, AP_REQUEST_INTERFACE_PING, ap_handle_ping_request},
-    {AP_REQUEST_SERVICE_COUNTER, AP_REQUEST_INTERFACE_COUNTER_INCREMENT, ap_handle_counter_increment},
+static const ap_service_registry_entry_t ap_service_registry[] = {
+    {AP_REQUEST_SERVICE_PING, AP_REQUEST_INTERFACE_PING,
+     AP_SERVICE_OWNER_AP0_CONTEXT_INDEX, ap_handle_ping_request},
+    {AP_REQUEST_SERVICE_COUNTER, AP_REQUEST_INTERFACE_COUNTER_INCREMENT,
+     AP_SERVICE_OWNER_AP0_CONTEXT_INDEX, ap_handle_counter_increment},
 };
 
-ap_request_handler_t find_ap_request_handler(UINT64 service_id, UINT64 interface_id) {
-    for (UINTN i = 0; i < sizeof(ap_request_dispatch_table) / sizeof(ap_request_dispatch_table[0]); i++) {
-        if (ap_request_dispatch_table[i].service_id == service_id &&
-            ap_request_dispatch_table[i].interface_id == interface_id) {
-            return ap_request_dispatch_table[i].handler;
+const ap_service_registry_entry_t *find_ap_service(UINT64 service_id, UINT64 interface_id) {
+    for (UINTN i = 0; i < sizeof(ap_service_registry) / sizeof(ap_service_registry[0]); i++) {
+        if (ap_service_registry[i].service_id == service_id &&
+            ap_service_registry[i].interface_id == interface_id) {
+            return &ap_service_registry[i];
         }
     }
     return 0;
 }
 
-UINT32 ap_dispatch_miss_result_code(UINT64 service_id, UINT64 interface_id) {
-    for (UINTN i = 0; i < sizeof(ap_request_dispatch_table) / sizeof(ap_request_dispatch_table[0]); i++) {
-        if (ap_request_dispatch_table[i].service_id == service_id) {
-            return (UINT32)interface_id;
+ap_service_lookup_status_t classify_ap_service_lookup(UINT64 service_id, UINT64 interface_id) {
+    int service_seen = 0;
+
+    for (UINTN i = 0; i < sizeof(ap_service_registry) / sizeof(ap_service_registry[0]); i++) {
+        if (ap_service_registry[i].service_id != service_id) {
+            continue;
+        }
+        service_seen = 1;
+        if (ap_service_registry[i].interface_id == interface_id) {
+            return AP_SERVICE_LOOKUP_OK;
         }
     }
-    return (UINT32)service_id;
+
+    return service_seen ? AP_SERVICE_LOOKUP_UNKNOWN_INTERFACE :
+                          AP_SERVICE_LOOKUP_UNKNOWN_SERVICE;
+}
+
+ap_request_handler_t find_ap_request_handler(UINT64 service_id, UINT64 interface_id) {
+    const ap_service_registry_entry_t *entry = find_ap_service(service_id, interface_id);
+    return entry ? entry->handler : 0;
+}
+
+UINT32 ap_dispatch_miss_result_code(UINT64 service_id, UINT64 interface_id) {
+    if (classify_ap_service_lookup(service_id, interface_id) ==
+        AP_SERVICE_LOOKUP_UNKNOWN_SERVICE) {
+        return (UINT32)service_id;
+    }
+    return (UINT32)interface_id;
 }

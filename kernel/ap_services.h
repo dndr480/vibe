@@ -18,6 +18,21 @@ typedef struct {
 
 typedef void (*ap_request_handler_t)(ap_service_context_t *ctx, ap_request_slot_t *slot);
 
+typedef enum {
+    AP_SERVICE_LOOKUP_OK = 0,
+    AP_SERVICE_LOOKUP_UNKNOWN_SERVICE = 1,
+    AP_SERVICE_LOOKUP_UNKNOWN_INTERFACE = 2,
+} ap_service_lookup_status_t;
+
+typedef struct {
+    UINT64 service_id;
+    UINT64 interface_id;
+    UINT32 owner_context_index;
+    ap_request_handler_t handler;
+} ap_service_registry_entry_t;
+
+const ap_service_registry_entry_t *find_ap_service(UINT64 service_id, UINT64 interface_id);
+ap_service_lookup_status_t classify_ap_service_lookup(UINT64 service_id, UINT64 interface_id);
 ap_request_handler_t find_ap_request_handler(UINT64 service_id, UINT64 interface_id);
 UINT32 ap_dispatch_miss_result_code(UINT64 service_id, UINT64 interface_id);
 

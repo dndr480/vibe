@@ -46,6 +46,62 @@ static void test_lookup(void) {
               "unknown service lookup fails");
 }
 
+static void test_registry_lookup(void) {
+    const UINT64 unknown_service = 0x41502d53564300ffULL;
+    const UINT64 unknown_interface = 0x41502d49464300ffULL;
+
+    const ap_service_registry_entry_t *ping =
+        find_ap_service(AP_REQUEST_SERVICE_PING, AP_REQUEST_INTERFACE_PING);
+    const ap_service_registry_entry_t *counter =
+        find_ap_service(AP_REQUEST_SERVICE_COUNTER,
+                        AP_REQUEST_INTERFACE_COUNTER_INCREMENT);
+
+    check_int(ping != 0, "PING registry lookup");
+    check_int(counter != 0, "COUNTER registry lookup");
+    if (ping) {
+        check_int(ping->service_id == AP_REQUEST_SERVICE_PING,
+                  "PING registry service id");
+        check_int(ping->interface_id == AP_REQUEST_INTERFACE_PING,
+                  "PING registry interface id");
+        check_int(ping->owner_context_index == 0,
+                  "PING owner is AP0 context");
+        check_int(ping->handler == find_ap_request_handler(AP_REQUEST_SERVICE_PING,
+                                                           AP_REQUEST_INTERFACE_PING),
+                  "PING registry handler matches compatibility lookup");
+    }
+    if (counter) {
+        check_int(counter->service_id == AP_REQUEST_SERVICE_COUNTER,
+                  "COUNTER registry service id");
+        check_int(counter->interface_id == AP_REQUEST_INTERFACE_COUNTER_INCREMENT,
+                  "COUNTER registry interface id");
+        check_int(counter->owner_context_index == 0,
+                  "COUNTER owner is AP0 context");
+        check_int(counter->handler ==
+                      find_ap_request_handler(AP_REQUEST_SERVICE_COUNTER,
+                                              AP_REQUEST_INTERFACE_COUNTER_INCREMENT),
+                  "COUNTER registry handler matches compatibility lookup");
+    }
+
+    check_int(find_ap_service(AP_REQUEST_SERVICE_PING, unknown_interface) == 0,
+              "known service unknown interface has no registry entry");
+    check_int(find_ap_service(unknown_service, AP_REQUEST_INTERFACE_PING) == 0,
+              "unknown service has no registry entry");
+    check_int(classify_ap_service_lookup(AP_REQUEST_SERVICE_PING,
+                                         AP_REQUEST_INTERFACE_PING) ==
+                  AP_SERVICE_LOOKUP_OK,
+              "PING registry status OK");
+    check_int(classify_ap_service_lookup(AP_REQUEST_SERVICE_COUNTER,
+                                         AP_REQUEST_INTERFACE_COUNTER_INCREMENT) ==
+                  AP_SERVICE_LOOKUP_OK,
+              "COUNTER registry status OK");
+    check_int(classify_ap_service_lookup(AP_REQUEST_SERVICE_PING, unknown_interface) ==
+                  AP_SERVICE_LOOKUP_UNKNOWN_INTERFACE,
+              "known service unknown interface status");
+    check_int(classify_ap_service_lookup(unknown_service, AP_REQUEST_INTERFACE_PING) ==
+                  AP_SERVICE_LOOKUP_UNKNOWN_SERVICE,
+              "unknown service status");
+}
+
 static void test_miss_result_code(void) {
     const UINT64 unknown_service = 0x41502d53564300ffULL;
 
@@ -180,6 +236,7 @@ static void test_handlers_use_explicit_context(void) {
 
 int main(void) {
     test_lookup();
+    test_registry_lookup();
     test_miss_result_code();
     test_ping_handler();
     test_counter_handler();
