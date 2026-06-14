@@ -37,6 +37,14 @@
 - For BSP fault display or BSP CPU/IDT paths, run BSP UD2 smoke.
 - After any temporary compile-time override, rebuild the default EFI with `kernel/build-kernel-efi` before committing.
 
+## Test Scripts And Visual Review
+
+- Prefer repo scripts for repeatable test actions: build variants, PXE power cycle, wait, screenshot capture, artifact naming, and default EFI restoration.
+- Do not treat a script that only captures a screenshot as a pass/fail oracle. The agent must still open the screenshot and visually verify the scenario-specific status lines.
+- A repo-local skill may be used as the visual review checklist for PXE screenshots. In that model, the skill should first direct the agent to run the relevant script, then inspect the produced screenshots and summarize the observed lines.
+- Keep executable test logic in scripts where possible. Use skills for orchestration guidance and visual interpretation, not as a replacement for runnable tests with exit codes.
+- If a script is added for a PXE scenario, update this workflow or the repo-local skill so future agents know when to run it and what screen lines to verify.
+
 ## Reporting
 
 - Report the exact checks and PXE scenarios run.
