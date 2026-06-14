@@ -33,6 +33,8 @@ typedef struct {
 
 const ap_service_registry_entry_t *find_ap_service(UINT64 service_id, UINT64 interface_id);
 ap_service_lookup_status_t classify_ap_service_lookup(UINT64 service_id, UINT64 interface_id);
+ap_service_lookup_status_t ap_service_owner_context_index(UINT64 service_id, UINT64 interface_id,
+                                                          UINT32 *owner_context_index);
 ap_request_handler_t find_ap_request_handler(UINT64 service_id, UINT64 interface_id);
 UINT32 ap_dispatch_miss_result_code(UINT64 service_id, UINT64 interface_id);
 

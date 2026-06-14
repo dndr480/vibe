@@ -657,6 +657,19 @@ typedef struct {
     UINT32 explicit_target;
 } ap_scheduler_t;
 
+typedef enum {
+    AP_REQUEST_ROUTE_OWNER = 0,
+    AP_REQUEST_ROUTE_EXPLICIT = 1,
+    AP_REQUEST_ROUTE_SCHEDULER_FALLBACK = 2,
+} ap_request_route_mode_t;
+
+typedef struct {
+    UINT32 mode;
+    UINT32 target_context_index;
+    UINT32 target_apic_id;
+    UINT32 owner_context_index;
+} ap_request_route_t;
+
 typedef struct {
     UINT64 vector;
     UINT64 error_code;
@@ -671,6 +684,7 @@ static system_interrupt_observe_t system_interrupt_observe;
 static bsp_fault_display_t bsp_fault_display;
 static ap_broadcast_ping_summary_t ap_broadcast_ping_summary;
 static ap_scheduler_t ap_scheduler;
+static ap_request_route_t ap_request_route;
 static ap_context_t ap_contexts[MAX_AP_CONTEXTS];
 static ap_context_t *ap_request_target_context = &ap_contexts[0];
 static ap_interrupt_observe_t *ap_request_interrupts __attribute__((used)) = &ap_contexts[0].interrupts;
@@ -768,6 +782,57 @@ static ap_context_t *select_ap_request_target_context(ap_scheduler_t *scheduler,
     scheduler->selected_context_index = ap_context_index(selected);
     scheduler->selected_apic_id = selected->boot.target_apic_id;
     return selected;
+}
+
+static int ap_request_plan_owner_context_index(const ap_request_plan_t *plan, UINTN plan_count,
+                                               UINT32 *owner_context_index) {
+    for (UINTN i = 0; i < plan_count; i++) {
+        UINT32 owner_index = 0;
+        if (ap_service_owner_context_index(plan[i].service_id, plan[i].interface_id,
+                                           &owner_index) == AP_SERVICE_LOOKUP_OK) {
+            *owner_context_index = owner_index;
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static void set_ap_request_route(ap_request_route_t *route, UINT32 mode,
+                                 ap_context_t *target_context, UINT32 owner_context_index) {
+    route->mode = mode;
+    route->target_context_index = ap_context_index(target_context);
+    route->target_apic_id = target_context->boot.target_apic_id;
+    route->owner_context_index = owner_context_index;
+}
+
+static ap_context_t *select_ap_request_route_context(ap_request_route_t *route,
+                                                     ap_scheduler_t *scheduler,
+                                                     ap_context_t *scheduler_target,
+                                                     const ap_request_plan_t *plan,
+                                                     UINTN plan_count,
+                                                     ap_context_t *contexts,
+                                                     UINTN context_count) {
+    ap_context_t *target = scheduler_target ? scheduler_target : ap0_context();
+    UINT32 owner_context_index = AP_REQUEST_TARGET_SCHEDULER;
+
+    if (scheduler->explicit_target) {
+        set_ap_request_route(route, AP_REQUEST_ROUTE_EXPLICIT, target,
+                             owner_context_index);
+        return target;
+    }
+
+    if (ap_request_plan_owner_context_index(plan, plan_count, &owner_context_index) &&
+        owner_context_index < context_count &&
+        owner_context_index < MAX_AP_CONTEXTS &&
+        ap_context_is_schedulable(&contexts[owner_context_index])) {
+        target = &contexts[owner_context_index];
+        set_ap_request_route(route, AP_REQUEST_ROUTE_OWNER, target, owner_context_index);
+        return target;
+    }
+
+    set_ap_request_route(route, AP_REQUEST_ROUTE_SCHEDULER_FALLBACK, target,
+                         owner_context_index);
+    return target;
 }
 
 static int address_in_range(UINT64 addr, UINT64 start, UINT64 size) {
@@ -3879,6 +3944,35 @@ static void draw_ap_scheduler_summary(framebuffer_t *fb, UINT32 *y, UINT32 fg,
     draw_line(fb, 48, y, line, color ? color : fg, bg, 2);
 }
 
+static const char *ap_request_route_mode_name(UINT32 mode) {
+    switch (mode) {
+    case AP_REQUEST_ROUTE_OWNER: return "OWNER";
+    case AP_REQUEST_ROUTE_EXPLICIT: return "EXPLICIT";
+    case AP_REQUEST_ROUTE_SCHEDULER_FALLBACK: return "FALLBACK";
+    default: return "UNKNOWN";
+    }
+}
+
+static void draw_ap_request_route_summary(framebuffer_t *fb, UINT32 *y, UINT32 fg,
+                                          UINT32 accent, UINT32 warn, UINT32 bg) {
+    char line[192];
+    ap_request_route_t *route = &ap_request_route;
+    char *p = append_str(line, "AP ROUTE: ");
+    p = append_str(p, ap_request_route_mode_name(route->mode));
+    p = append_str(p, "  TARGET: ");
+    p = append_dec(p, route->target_context_index + 1U);
+    *p++ = '/';
+    *p = 0;
+    p = append_dec(p, route->target_apic_id);
+    if (route->owner_context_index != AP_REQUEST_TARGET_SCHEDULER) {
+        p = append_str(p, "  OWNER: ");
+        append_dec(p, route->owner_context_index + 1U);
+    }
+
+    UINT32 color = route->mode == AP_REQUEST_ROUTE_SCHEDULER_FALLBACK ? warn : accent;
+    draw_line(fb, 48, y, line, color ? color : fg, bg, 2);
+}
+
 static void draw_ap_broadcast_ping_summary(framebuffer_t *fb, UINT32 *y, UINT32 fg,
                                            UINT32 accent, UINT32 warn, UINT32 bg) {
     ap_broadcast_ping_summary_t *summary = &ap_broadcast_ping_summary;
@@ -4017,6 +4111,7 @@ static void draw_memory_map(framebuffer_t *fb, efi_memory_map_t *map, paging_inf
                                     fg, accent, warn, bg);
         }
         draw_ap_scheduler_summary(fb, &y, fg, accent, warn, bg);
+        draw_ap_request_route_summary(fb, &y, fg, accent, warn, bg);
         draw_ap_broadcast_ping_summary(fb, &y, fg, accent, warn, bg);
         draw_ap_boot_info(fb, &y, &target_context->boot, fg, accent, warn, bg);
         draw_ap_queue_summary(fb, &y, target_context, fg, accent, warn, bg);
@@ -4328,15 +4423,6 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE image, EFI_SYSTEM_TABLE *st) {
             bring_up_one_ap(&ap_contexts[i], i, &acpi, &memory_map, &paging);
         }
     }
-    build_online_ap_registry(&ap_scheduler, ap_contexts, ap_context_count);
-    ap_context_t *request_target = select_ap_request_target_context(&ap_scheduler, ap_contexts,
-                                                                    ap_context_count);
-    set_ap_request_target_context(request_target);
-    if (ap_request_fault_test_enabled()) {
-        reset_ap_broadcast_ping_summary();
-    } else {
-        run_ap_broadcast_ping(ap_contexts, ap_context_count, request_target);
-    }
     const ap_request_plan_t ap_request_plan[] = {
         {VIBE_AP_FIRST_REQUEST_OPCODE, VIBE_AP_FIRST_REQUEST_SERVICE_ID,
          VIBE_AP_FIRST_REQUEST_INTERFACE_ID, 1},
@@ -4355,8 +4441,24 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE image, EFI_SYSTEM_TABLE *st) {
         {VIBE_AP_SECOND_BATCH_FOURTH_REQUEST_OPCODE, VIBE_AP_SECOND_BATCH_FOURTH_REQUEST_SERVICE_ID,
          VIBE_AP_SECOND_BATCH_FOURTH_REQUEST_INTERFACE_ID, 8},
     };
-    (void)run_ap_request_stream(request_target, ap_request_plan,
-                                sizeof(ap_request_plan) / sizeof(ap_request_plan[0]));
+    UINTN ap_request_plan_count = sizeof(ap_request_plan) / sizeof(ap_request_plan[0]);
+    build_online_ap_registry(&ap_scheduler, ap_contexts, ap_context_count);
+    ap_context_t *scheduler_target = select_ap_request_target_context(&ap_scheduler, ap_contexts,
+                                                                      ap_context_count);
+    ap_context_t *request_target = select_ap_request_route_context(&ap_request_route,
+                                                                   &ap_scheduler,
+                                                                   scheduler_target,
+                                                                   ap_request_plan,
+                                                                   ap_request_plan_count,
+                                                                   ap_contexts,
+                                                                   ap_context_count);
+    set_ap_request_target_context(request_target);
+    if (ap_request_fault_test_enabled()) {
+        reset_ap_broadcast_ping_summary();
+    } else {
+        run_ap_broadcast_ping(ap_contexts, ap_context_count, request_target);
+    }
+    (void)run_ap_request_stream(request_target, ap_request_plan, ap_request_plan_count);
 
     clear_screen(&fb, bg);
     draw_memory_map(&fb, &memory_map, &paging, &acpi, request_target,

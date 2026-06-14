@@ -102,6 +102,40 @@ static void test_registry_lookup(void) {
               "unknown service status");
 }
 
+static void test_service_owner_lookup(void) {
+    const UINT64 unknown_service = 0x41502d53564300ffULL;
+    const UINT64 unknown_interface = 0x41502d49464300ffULL;
+    UINT32 owner = 0xffffffffU;
+
+    check_int(ap_service_owner_context_index(AP_REQUEST_SERVICE_PING,
+                                             AP_REQUEST_INTERFACE_PING,
+                                             &owner) == AP_SERVICE_LOOKUP_OK,
+              "PING owner lookup status OK");
+    check_int(owner == 0, "PING owner lookup returns AP0 context");
+
+    owner = 0xffffffffU;
+    check_int(ap_service_owner_context_index(AP_REQUEST_SERVICE_COUNTER,
+                                             AP_REQUEST_INTERFACE_COUNTER_INCREMENT,
+                                             &owner) == AP_SERVICE_LOOKUP_OK,
+              "COUNTER owner lookup status OK");
+    check_int(owner == 0, "COUNTER owner lookup returns AP0 context");
+
+    owner = 0x12345678U;
+    check_int(ap_service_owner_context_index(AP_REQUEST_SERVICE_PING, unknown_interface,
+                                             &owner) ==
+                  AP_SERVICE_LOOKUP_UNKNOWN_INTERFACE,
+              "known service unknown interface owner status");
+    check_int(owner == 0x12345678U,
+              "known service unknown interface leaves owner unchanged");
+
+    owner = 0x87654321U;
+    check_int(ap_service_owner_context_index(unknown_service, AP_REQUEST_INTERFACE_PING,
+                                             &owner) ==
+                  AP_SERVICE_LOOKUP_UNKNOWN_SERVICE,
+              "unknown service owner status");
+    check_int(owner == 0x87654321U, "unknown service leaves owner unchanged");
+}
+
 static void test_miss_result_code(void) {
     const UINT64 unknown_service = 0x41502d53564300ffULL;
 
@@ -237,6 +271,7 @@ static void test_handlers_use_explicit_context(void) {
 int main(void) {
     test_lookup();
     test_registry_lookup();
+    test_service_owner_lookup();
     test_miss_result_code();
     test_ping_handler();
     test_counter_handler();

@@ -90,6 +90,18 @@ ap_service_lookup_status_t classify_ap_service_lookup(UINT64 service_id, UINT64 
                           AP_SERVICE_LOOKUP_UNKNOWN_SERVICE;
 }
 
+ap_service_lookup_status_t ap_service_owner_context_index(UINT64 service_id, UINT64 interface_id,
+                                                          UINT32 *owner_context_index) {
+    const ap_service_registry_entry_t *entry = find_ap_service(service_id, interface_id);
+    if (entry) {
+        if (owner_context_index) {
+            *owner_context_index = entry->owner_context_index;
+        }
+        return AP_SERVICE_LOOKUP_OK;
+    }
+    return classify_ap_service_lookup(service_id, interface_id);
+}
+
 ap_request_handler_t find_ap_request_handler(UINT64 service_id, UINT64 interface_id) {
     const ap_service_registry_entry_t *entry = find_ap_service(service_id, interface_id);
     return entry ? entry->handler : 0;
