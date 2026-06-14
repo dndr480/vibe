@@ -657,6 +657,11 @@ _Static_assert(__builtin_offsetof(bsp_wait_observe_t, timer_count) == 8,
                "BSP wait timer count offset must match ISR writes");
 
 typedef struct {
+    cpu_local_t cpu;
+    idt_entry_t idt[256];
+} bsp_context_t;
+
+typedef struct {
     ap_boot_info_t boot;
     UINT8 boot_stack[AP_BOOT_STACK_SIZE] __attribute__((aligned(16)));
     cpu_local_t cpu;
@@ -685,8 +690,7 @@ typedef struct {
     UINT64 rflags;
 } fault_frame_t;
 
-static idt_entry_t bsp_idt[256];
-static cpu_local_t bsp_cpu;
+static bsp_context_t bsp_context;
 static bsp_interrupt_observe_t bsp_interrupt_observe;
 static system_interrupt_observe_t system_interrupt_observe;
 static framebuffer_t kernel_framebuffer;
@@ -1547,7 +1551,7 @@ void fault_dispatch(fault_frame_t *frame) {
     append_hex64(p, read_cr3());
     draw_line(fb, 48, &y, line, kernel_fg, kernel_bg, 2);
 
-    cpu_local_t *cpu = &bsp_cpu;
+    cpu_local_t *cpu = &bsp_context.cpu;
     p = append_str(line, "CPU: ");
     p = append_dec(p, cpu ? cpu->id : 0);
     p = append_str(p, "  TR: ");
@@ -1837,7 +1841,7 @@ static void set_idt_gate_in(idt_entry_t *table, UINT32 vector, UINT64 addr, UINT
 
 static void set_bsp_idt_gate(UINT32 vector, UINT64 addr, UINT16 selector, UINT8 ist,
                              UINT8 type_attr) {
-    set_idt_gate_in(bsp_idt, vector, addr, selector, ist, type_attr);
+    set_idt_gate_in(bsp_context.idt, vector, addr, selector, ist, type_attr);
 }
 
 static void load_idt_entries(idt_entry_t *table) {
@@ -1849,7 +1853,7 @@ static void load_idt_entries(idt_entry_t *table) {
 }
 
 static void load_bsp_idt_table(void) {
-    load_idt_entries(bsp_idt);
+    load_idt_entries(bsp_context.idt);
 }
 
 static void store_idtr(descriptor_table_ptr_t *idtr) {
@@ -3960,8 +3964,8 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE image, EFI_SYSTEM_TABLE *st) {
     kernel_fg = fg;
     kernel_accent = accent;
     kernel_warn = warn;
-    init_cpu_local(&bsp_cpu, 0);
-    install_cpu_tables(&bsp_cpu);
+    init_cpu_local(&bsp_context.cpu, 0);
+    install_cpu_tables(&bsp_context.cpu);
     install_bsp_idt();
 
     paging_info_t paging;
