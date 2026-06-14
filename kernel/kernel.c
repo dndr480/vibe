@@ -685,7 +685,7 @@ typedef struct {
     UINT64 rflags;
 } fault_frame_t;
 
-static idt_entry_t idt[256];
+static idt_entry_t bsp_idt[256];
 static cpu_local_t cpu0;
 static bsp_interrupt_observe_t bsp_interrupt_observe;
 static system_interrupt_observe_t system_interrupt_observe;
@@ -1836,7 +1836,7 @@ static void set_idt_gate_in(idt_entry_t *table, UINT32 vector, UINT64 addr, UINT
 }
 
 static void set_idt_gate(UINT32 vector, UINT64 addr, UINT16 selector, UINT8 ist, UINT8 type_attr) {
-    set_idt_gate_in(idt, vector, addr, selector, ist, type_attr);
+    set_idt_gate_in(bsp_idt, vector, addr, selector, ist, type_attr);
 }
 
 static void load_idt_entries(idt_entry_t *table) {
@@ -1848,7 +1848,7 @@ static void load_idt_entries(idt_entry_t *table) {
 }
 
 static void load_idt_table(void) {
-    load_idt_entries(idt);
+    load_idt_entries(bsp_idt);
 }
 
 static void store_idtr(descriptor_table_ptr_t *idtr) {
