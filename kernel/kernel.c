@@ -142,6 +142,13 @@ enum {
 };
 
 enum {
+    AP_FAULT_PHASE_NONE = 0,
+    AP_FAULT_PHASE_STARTUP = 1,
+    AP_FAULT_PHASE_LOOP = 2,
+    AP_FAULT_PHASE_REQUEST = 3,
+};
+
+enum {
     AP_REQUEST_STATUS_EMPTY = 0,
     AP_REQUEST_STATUS_PENDING = 1,
     AP_REQUEST_STATUS_RUNNING = 2,
@@ -398,6 +405,12 @@ typedef struct {
     volatile UINT64 fault_cs;
     volatile UINT64 fault_rflags;
     volatile UINT64 fault_cr2;
+    volatile UINT32 fault_phase;
+    volatile UINT32 fault_request_status;
+    volatile UINT32 fault_request_opcode;
+    volatile UINT32 fault_request_sequence;
+    volatile UINT64 fault_request_id_high;
+    volatile UINT64 fault_request_id_low;
     UINT32 target_acpi_uid;
     UINT32 target_apic_id;
     UINT32 sipi_vector;
@@ -457,6 +470,8 @@ static uuid128_t current_request_uuid;
 static ap_boot_info_t ap_boot;
 static ap_request_slot_t ap_request;
 static UINT8 ap_boot_stack[AP_BOOT_STACK_SIZE] __attribute__((aligned(16)));
+
+static int cmpxchg_u32(volatile UINT32 *ptr, UINT32 expected, UINT32 desired);
 
 extern void isr_breakpoint(void);
 extern void isr_fault_ud(void);
@@ -1197,16 +1212,37 @@ void fault_dispatch(fault_frame_t *frame) {
 void ap_fault_dispatch(fault_frame_t *frame) {
     __asm__ __volatile__("cli" : : : "memory");
 
+    UINT32 request_status = ap_request.status;
+    UINT32 fault_phase = AP_FAULT_PHASE_STARTUP;
+    if (ap_boot.entry_state == AP_ENTRY_STATE_REQUEST ||
+        request_status == AP_REQUEST_STATUS_RUNNING) {
+        fault_phase = AP_FAULT_PHASE_REQUEST;
+    } else if (ap_boot.entry_state == AP_ENTRY_STATE_LOOP) {
+        fault_phase = AP_FAULT_PHASE_LOOP;
+    }
+
     ap_boot.fault_vector = frame->vector;
     ap_boot.fault_error_code = frame->error_code;
     ap_boot.fault_rip = frame->rip;
     ap_boot.fault_cs = frame->cs;
     ap_boot.fault_rflags = frame->rflags;
     ap_boot.fault_cr2 = read_cr2();
+    ap_boot.fault_phase = fault_phase;
+    ap_boot.fault_request_status = request_status;
+    ap_boot.fault_request_opcode = ap_request.opcode;
+    ap_boot.fault_request_sequence = ap_request.sequence;
+    ap_boot.fault_request_id_high = ap_request.request_id_high;
+    ap_boot.fault_request_id_low = ap_request.request_id_low;
     ap_boot.entry_state = AP_ENTRY_STATE_FAULT;
     ap_boot.ap_state = AP_BOOT_STATE_FAULTED;
     __asm__ __volatile__("mfence" : : : "memory");
-    ap_request.status = AP_REQUEST_STATUS_FAULT;
+    if (!cmpxchg_u32(&ap_request.status, AP_REQUEST_STATUS_PENDING, AP_REQUEST_STATUS_FAULT)) {
+        if (!cmpxchg_u32(&ap_request.status, AP_REQUEST_STATUS_RUNNING, AP_REQUEST_STATUS_FAULT)) {
+            if (ap_request.status == AP_REQUEST_STATUS_EMPTY) {
+                ap_request.status = AP_REQUEST_STATUS_FAULT;
+            }
+        }
+    }
     __asm__ __volatile__("mfence" : : : "memory");
     ap_boot.online = 1;
 
@@ -2166,6 +2202,12 @@ static void bring_up_one_ap(ap_boot_info_t *boot, acpi_info_t *acpi, efi_memory_
     boot->fault_cs = 0;
     boot->fault_rflags = 0;
     boot->fault_cr2 = 0;
+    boot->fault_phase = AP_FAULT_PHASE_NONE;
+    boot->fault_request_status = AP_REQUEST_STATUS_EMPTY;
+    boot->fault_request_opcode = AP_REQUEST_OP_NONE;
+    boot->fault_request_sequence = 0;
+    boot->fault_request_id_high = 0;
+    boot->fault_request_id_low = 0;
     boot->wait_loops = 0;
     boot->icr_timeouts = 0;
 
@@ -2277,6 +2319,16 @@ static const char *ap_entry_state_name(UINT32 state) {
     }
 }
 
+static const char *ap_fault_phase_name(UINT32 phase) {
+    switch (phase) {
+    case AP_FAULT_PHASE_NONE: return "NONE";
+    case AP_FAULT_PHASE_STARTUP: return "STARTUP";
+    case AP_FAULT_PHASE_LOOP: return "LOOP";
+    case AP_FAULT_PHASE_REQUEST: return "REQUEST";
+    default: return "UNKNOWN";
+    }
+}
+
 static const char *ap_request_status_name(UINT32 status) {
     switch (status) {
     case AP_REQUEST_STATUS_EMPTY: return "EMPTY";
@@ -2345,6 +2397,8 @@ static void draw_ap_boot_info(framebuffer_t *fb, UINT32 *y, ap_boot_info_t *boot
 
     if (boot->fault_vector != 0) {
         p = append_str(line, "AP FAULT: ");
+        p = append_str(p, ap_fault_phase_name(boot->fault_phase));
+        p = append_str(p, "  VEC: ");
         p = append_dec64(p, boot->fault_vector);
         p = append_str(p, " ");
         p = append_str(p, fault_vector_name(boot->fault_vector));
@@ -2361,6 +2415,21 @@ static void draw_ap_boot_info(framebuffer_t *fb, UINT32 *y, ap_boot_info_t *boot
         p = append_str(p, "  RFLAGS: ");
         append_hex64(p, boot->fault_rflags);
         draw_line(fb, 48, y, line, warn, bg, 2);
+
+        if (boot->fault_phase == AP_FAULT_PHASE_REQUEST) {
+            p = append_str(line, "AP FAULT REQ: ");
+            p = append_str(p, ap_request_op_name(boot->fault_request_opcode));
+            p = append_str(p, "  STATUS: ");
+            p = append_str(p, ap_request_status_name(boot->fault_request_status));
+            p = append_str(p, "  SEQ: ");
+            p = append_dec(p, boot->fault_request_sequence);
+            p = append_str(p, "  ID: ");
+            p = append_hex64(p, boot->fault_request_id_high);
+            *p++ = '-';
+            *p = 0;
+            append_hex64(p, boot->fault_request_id_low);
+            draw_line(fb, 48, y, line, warn, bg, 2);
+        }
     }
 }
 
