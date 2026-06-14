@@ -406,7 +406,7 @@ typedef struct {
     volatile UINT64 fault_rflags;
     volatile UINT64 fault_cr2;
     volatile UINT32 fault_phase;
-    volatile UINT32 fault_request_status;
+    volatile UINT32 fault_request_state;
     volatile UINT32 fault_request_opcode;
     volatile UINT32 fault_request_sequence;
     volatile UINT64 fault_request_id_high;
@@ -420,18 +420,33 @@ typedef struct {
 } ap_boot_info_t;
 
 typedef struct {
-    volatile UINT32 status;
+    volatile UINT32 source_cpu;
+    volatile UINT32 target_cpu;
     volatile UINT32 opcode;
     volatile UINT32 sequence;
-    volatile UINT32 handled_count;
-    volatile UINT32 wait_loops;
+    volatile UINT64 id_high;
+    volatile UINT64 id_low;
+} ap_request_header_t;
+
+typedef struct {
     volatile UINT32 result_code;
+    volatile UINT32 fault_code;
     volatile UINT64 request_id_high;
     volatile UINT64 request_id_low;
-    volatile UINT64 result_id_high;
-    volatile UINT64 result_id_low;
     volatile UINT64 result_cs;
     volatile UINT64 result_tr;
+} ap_reply_header_t;
+
+typedef struct {
+    volatile UINT32 handled_count;
+    volatile UINT32 wait_loops;
+} ap_request_metrics_t;
+
+typedef struct {
+    volatile UINT32 state;
+    ap_request_header_t request;
+    ap_reply_header_t reply;
+    ap_request_metrics_t metrics;
 } ap_request_slot_t;
 
 typedef struct {
@@ -1212,10 +1227,10 @@ void fault_dispatch(fault_frame_t *frame) {
 void ap_fault_dispatch(fault_frame_t *frame) {
     __asm__ __volatile__("cli" : : : "memory");
 
-    UINT32 request_status = ap_request.status;
+    UINT32 request_state = ap_request.state;
     UINT32 fault_phase = AP_FAULT_PHASE_STARTUP;
     if (ap_boot.entry_state == AP_ENTRY_STATE_REQUEST ||
-        request_status == AP_REQUEST_STATUS_RUNNING) {
+        request_state == AP_REQUEST_STATUS_RUNNING) {
         fault_phase = AP_FAULT_PHASE_REQUEST;
     } else if (ap_boot.entry_state == AP_ENTRY_STATE_LOOP) {
         fault_phase = AP_FAULT_PHASE_LOOP;
@@ -1228,18 +1243,28 @@ void ap_fault_dispatch(fault_frame_t *frame) {
     ap_boot.fault_rflags = frame->rflags;
     ap_boot.fault_cr2 = read_cr2();
     ap_boot.fault_phase = fault_phase;
-    ap_boot.fault_request_status = request_status;
-    ap_boot.fault_request_opcode = ap_request.opcode;
-    ap_boot.fault_request_sequence = ap_request.sequence;
-    ap_boot.fault_request_id_high = ap_request.request_id_high;
-    ap_boot.fault_request_id_low = ap_request.request_id_low;
+    ap_boot.fault_request_state = request_state;
+    ap_boot.fault_request_opcode = ap_request.request.opcode;
+    ap_boot.fault_request_sequence = ap_request.request.sequence;
+    ap_boot.fault_request_id_high = ap_request.request.id_high;
+    ap_boot.fault_request_id_low = ap_request.request.id_low;
     ap_boot.entry_state = AP_ENTRY_STATE_FAULT;
     ap_boot.ap_state = AP_BOOT_STATE_FAULTED;
     __asm__ __volatile__("mfence" : : : "memory");
-    if (!cmpxchg_u32(&ap_request.status, AP_REQUEST_STATUS_PENDING, AP_REQUEST_STATUS_FAULT)) {
-        if (!cmpxchg_u32(&ap_request.status, AP_REQUEST_STATUS_RUNNING, AP_REQUEST_STATUS_FAULT)) {
-            if (ap_request.status == AP_REQUEST_STATUS_EMPTY) {
-                ap_request.status = AP_REQUEST_STATUS_FAULT;
+    if (request_state == AP_REQUEST_STATUS_EMPTY ||
+        request_state == AP_REQUEST_STATUS_PENDING ||
+        request_state == AP_REQUEST_STATUS_RUNNING) {
+        if (request_state == AP_REQUEST_STATUS_PENDING ||
+            request_state == AP_REQUEST_STATUS_RUNNING) {
+            ap_request.reply.request_id_high = ap_request.request.id_high;
+            ap_request.reply.request_id_low = ap_request.request.id_low;
+        }
+        ap_request.reply.fault_code = (UINT32)frame->vector;
+    }
+    if (!cmpxchg_u32(&ap_request.state, AP_REQUEST_STATUS_PENDING, AP_REQUEST_STATUS_FAULT)) {
+        if (!cmpxchg_u32(&ap_request.state, AP_REQUEST_STATUS_RUNNING, AP_REQUEST_STATUS_FAULT)) {
+            if (ap_request.state == AP_REQUEST_STATUS_EMPTY) {
+                ap_request.state = AP_REQUEST_STATUS_FAULT;
             }
         }
     }
@@ -1468,18 +1493,21 @@ static void run_ap_fault_test_if_enabled(void) {
 }
 
 static void reset_ap_request_slot(ap_request_slot_t *slot) {
-    slot->status = AP_REQUEST_STATUS_EMPTY;
-    slot->opcode = AP_REQUEST_OP_NONE;
-    slot->sequence = 0;
-    slot->handled_count = 0;
-    slot->wait_loops = 0;
-    slot->result_code = 0;
-    slot->request_id_high = 0;
-    slot->request_id_low = 0;
-    slot->result_id_high = 0;
-    slot->result_id_low = 0;
-    slot->result_cs = 0;
-    slot->result_tr = 0;
+    slot->state = AP_REQUEST_STATUS_EMPTY;
+    slot->request.source_cpu = 0;
+    slot->request.target_cpu = 0;
+    slot->request.opcode = AP_REQUEST_OP_NONE;
+    slot->request.sequence = 0;
+    slot->request.id_high = 0;
+    slot->request.id_low = 0;
+    slot->reply.result_code = 0;
+    slot->reply.fault_code = 0;
+    slot->reply.request_id_high = 0;
+    slot->reply.request_id_low = 0;
+    slot->reply.result_cs = 0;
+    slot->reply.result_tr = 0;
+    slot->metrics.handled_count = 0;
+    slot->metrics.wait_loops = 0;
 }
 
 static int cmpxchg_u32(volatile UINT32 *ptr, UINT32 expected, UINT32 desired) {
@@ -1493,15 +1521,22 @@ static int cmpxchg_u32(volatile UINT32 *ptr, UINT32 expected, UINT32 desired) {
     return success ? 1 : 0;
 }
 
-static int ap_request_status_terminal(UINT32 status) {
-    return status == AP_REQUEST_STATUS_DONE ||
-           status == AP_REQUEST_STATUS_BAD_OP ||
-           status == AP_REQUEST_STATUS_FAULT;
+static int ap_request_state_terminal(UINT32 state) {
+    return state == AP_REQUEST_STATUS_DONE ||
+           state == AP_REQUEST_STATUS_BAD_OP ||
+           state == AP_REQUEST_STATUS_FAULT;
 }
 
-static void complete_ap_request(UINT32 status) {
+static void begin_ap_reply(ap_request_slot_t *slot) {
+    slot->reply.request_id_high = slot->request.id_high;
+    slot->reply.request_id_low = slot->request.id_low;
+    slot->reply.result_code = 0;
+    slot->reply.fault_code = 0;
+}
+
+static void complete_ap_request(UINT32 state) {
     __asm__ __volatile__("mfence" : : : "memory");
-    (void)cmpxchg_u32(&ap_request.status, AP_REQUEST_STATUS_RUNNING, status);
+    (void)cmpxchg_u32(&ap_request.state, AP_REQUEST_STATUS_RUNNING, state);
     __asm__ __volatile__("mfence" : : : "memory");
 }
 
@@ -1509,12 +1544,11 @@ static void ap_handle_ping_request(ap_request_slot_t *slot) {
 #if VIBE_AP_REQUEST_FAULT_TEST == VIBE_AP_REQUEST_FAULT_TEST_UD2
     __asm__ __volatile__("ud2" : : : "memory");
 #endif
-    slot->result_id_high = slot->request_id_high;
-    slot->result_id_low = slot->request_id_low;
-    slot->result_cs = read_cs();
-    slot->result_tr = read_tr();
-    slot->handled_count = slot->handled_count + 1U;
-    slot->result_code = 0;
+    slot->reply.result_cs = read_cs();
+    slot->reply.result_tr = read_tr();
+    slot->reply.result_code = 0;
+    slot->reply.fault_code = 0;
+    slot->metrics.handled_count = slot->metrics.handled_count + 1U;
 }
 
 static void ap_halt_after_request(void) __attribute__((noreturn));
@@ -1532,22 +1566,24 @@ static void ap_request_loop(void) {
     ap_boot.online = 1;
 
     for (;;) {
-        if (ap_request.status == AP_REQUEST_STATUS_PENDING) {
-            if (!cmpxchg_u32(&ap_request.status, AP_REQUEST_STATUS_PENDING,
+        if (ap_request.state == AP_REQUEST_STATUS_PENDING) {
+            if (!cmpxchg_u32(&ap_request.state, AP_REQUEST_STATUS_PENDING,
                              AP_REQUEST_STATUS_RUNNING)) {
                 __asm__ __volatile__("pause" : : : "memory");
                 continue;
             }
+            begin_ap_reply(&ap_request);
             ap_boot.entry_state = AP_ENTRY_STATE_REQUEST;
             __asm__ __volatile__("mfence" : : : "memory");
 
-            if (ap_request.opcode == AP_REQUEST_OP_PING) {
+            if (ap_request.request.opcode == AP_REQUEST_OP_PING) {
                 ap_handle_ping_request(&ap_request);
                 ap_boot.ap_state = AP_BOOT_STATE_HALTED;
                 ap_boot.entry_state = AP_ENTRY_STATE_HALTED;
                 complete_ap_request(AP_REQUEST_STATUS_DONE);
             } else {
-                ap_request.result_code = ap_request.opcode;
+                ap_request.reply.result_code = ap_request.request.opcode;
+                ap_request.reply.fault_code = 0;
                 ap_boot.ap_state = AP_BOOT_STATE_HALTED;
                 ap_boot.entry_state = AP_ENTRY_STATE_HALTED;
                 complete_ap_request(AP_REQUEST_STATUS_BAD_OP);
@@ -1561,38 +1597,42 @@ static void ap_request_loop(void) {
 static void send_ap_ping_request(ap_request_slot_t *slot, ap_boot_info_t *boot) {
     reset_ap_request_slot(slot);
     if (boot->ap_state == AP_BOOT_STATE_FAULTED) {
-        slot->status = AP_REQUEST_STATUS_FAULT;
+        slot->reply.fault_code = (UINT32)boot->fault_vector;
+        slot->state = AP_REQUEST_STATUS_FAULT;
         return;
     }
     if (boot->error != AP_BOOT_OK || !boot->online) {
-        slot->status = AP_REQUEST_STATUS_SKIPPED;
+        slot->state = AP_REQUEST_STATUS_SKIPPED;
         return;
     }
 
-    slot->opcode = AP_REQUEST_OP_PING;
-    slot->sequence = 1;
-    slot->request_id_high = 0x41502d50494e4721ULL;
-    slot->request_id_low = 0x0000000000000001ULL;
+    slot->request.source_cpu = 0;
+    slot->request.target_cpu = 1;
+    slot->request.opcode = AP_REQUEST_OP_PING;
+    slot->request.sequence = 1;
+    slot->request.id_high = 0x41502d50494e4721ULL;
+    slot->request.id_low = 0x0000000000000001ULL;
     __asm__ __volatile__("mfence" : : : "memory");
-    slot->status = AP_REQUEST_STATUS_PENDING;
+    slot->state = AP_REQUEST_STATUS_PENDING;
 
     for (UINT32 i = 0; i < AP_REQUEST_TIMEOUT_LOOPS; i++) {
-        UINT32 status = slot->status;
-        if (ap_request_status_terminal(status)) {
-            slot->wait_loops = i;
+        UINT32 state = slot->state;
+        if (ap_request_state_terminal(state)) {
+            slot->metrics.wait_loops = i;
             return;
         }
         if (boot->ap_state == AP_BOOT_STATE_FAULTED) {
-            slot->wait_loops = i;
-            slot->status = AP_REQUEST_STATUS_FAULT;
+            slot->metrics.wait_loops = i;
+            slot->reply.fault_code = (UINT32)boot->fault_vector;
+            slot->state = AP_REQUEST_STATUS_FAULT;
             return;
         }
         __asm__ __volatile__("pause" : : : "memory");
     }
 
-    slot->wait_loops = AP_REQUEST_TIMEOUT_LOOPS;
-    if (!cmpxchg_u32(&slot->status, AP_REQUEST_STATUS_PENDING, AP_REQUEST_STATUS_TIMEOUT)) {
-        (void)cmpxchg_u32(&slot->status, AP_REQUEST_STATUS_RUNNING, AP_REQUEST_STATUS_TIMEOUT);
+    slot->metrics.wait_loops = AP_REQUEST_TIMEOUT_LOOPS;
+    if (!cmpxchg_u32(&slot->state, AP_REQUEST_STATUS_PENDING, AP_REQUEST_STATUS_TIMEOUT)) {
+        (void)cmpxchg_u32(&slot->state, AP_REQUEST_STATUS_RUNNING, AP_REQUEST_STATUS_TIMEOUT);
     }
 }
 
@@ -2203,7 +2243,7 @@ static void bring_up_one_ap(ap_boot_info_t *boot, acpi_info_t *acpi, efi_memory_
     boot->fault_rflags = 0;
     boot->fault_cr2 = 0;
     boot->fault_phase = AP_FAULT_PHASE_NONE;
-    boot->fault_request_status = AP_REQUEST_STATUS_EMPTY;
+    boot->fault_request_state = AP_REQUEST_STATUS_EMPTY;
     boot->fault_request_opcode = AP_REQUEST_OP_NONE;
     boot->fault_request_sequence = 0;
     boot->fault_request_id_high = 0;
@@ -2329,8 +2369,8 @@ static const char *ap_fault_phase_name(UINT32 phase) {
     }
 }
 
-static const char *ap_request_status_name(UINT32 status) {
-    switch (status) {
+static const char *ap_request_state_name(UINT32 state) {
+    switch (state) {
     case AP_REQUEST_STATUS_EMPTY: return "EMPTY";
     case AP_REQUEST_STATUS_PENDING: return "PENDING";
     case AP_REQUEST_STATUS_RUNNING: return "RUNNING";
@@ -2419,8 +2459,8 @@ static void draw_ap_boot_info(framebuffer_t *fb, UINT32 *y, ap_boot_info_t *boot
         if (boot->fault_phase == AP_FAULT_PHASE_REQUEST) {
             p = append_str(line, "AP FAULT REQ: ");
             p = append_str(p, ap_request_op_name(boot->fault_request_opcode));
-            p = append_str(p, "  STATUS: ");
-            p = append_str(p, ap_request_status_name(boot->fault_request_status));
+            p = append_str(p, "  STATE: ");
+            p = append_str(p, ap_request_state_name(boot->fault_request_state));
             p = append_str(p, "  SEQ: ");
             p = append_dec(p, boot->fault_request_sequence);
             p = append_str(p, "  ID: ");
@@ -2437,36 +2477,56 @@ static void draw_ap_request_info(framebuffer_t *fb, UINT32 *y, ap_request_slot_t
                                  UINT32 fg, UINT32 accent, UINT32 warn, UINT32 bg) {
     char line[192];
     char *p;
-    int ok = request->status == AP_REQUEST_STATUS_DONE &&
-             request->opcode == AP_REQUEST_OP_PING &&
-             request->result_code == 0 &&
-             request->request_id_high == request->result_id_high &&
-             request->request_id_low == request->result_id_low;
+    int ok = request->state == AP_REQUEST_STATUS_DONE &&
+             request->request.opcode == AP_REQUEST_OP_PING &&
+             request->reply.result_code == 0 &&
+             request->reply.fault_code == 0 &&
+             request->request.id_high == request->reply.request_id_high &&
+             request->request.id_low == request->reply.request_id_low;
+    int has_reply_id = request->reply.request_id_high != 0 || request->reply.request_id_low != 0;
+    int has_terminal_reply = has_reply_id &&
+                             (request->state == AP_REQUEST_STATUS_DONE ||
+                              request->state == AP_REQUEST_STATUS_BAD_OP ||
+                              request->state == AP_REQUEST_STATUS_FAULT);
 
     p = append_str(line, "AP REQUEST: ");
-    p = append_str(p, ap_request_op_name(request->opcode));
+    p = append_str(p, ap_request_op_name(request->request.opcode));
     p = append_str(p, ok ? " OK" : " NOT-OK");
-    p = append_str(p, "  STATUS: ");
-    p = append_str(p, ap_request_status_name(request->status));
+    p = append_str(p, "  STATE: ");
+    p = append_str(p, ap_request_state_name(request->state));
     p = append_str(p, "  SEQ: ");
-    p = append_dec(p, request->sequence);
+    p = append_dec(p, request->request.sequence);
+    p = append_str(p, "  CPU: ");
+    p = append_dec(p, request->request.source_cpu);
+    *p++ = '/';
+    *p = 0;
+    p = append_dec(p, request->request.target_cpu);
     p = append_str(p, "  WAIT: ");
-    p = append_dec(p, request->wait_loops);
+    p = append_dec(p, request->metrics.wait_loops);
     p = append_str(p, "  COUNT: ");
-    append_dec(p, request->handled_count);
+    append_dec(p, request->metrics.handled_count);
     draw_line(fb, 48, y, line, ok ? accent : warn, bg, 2);
 
-    p = append_str(line, "AP REQ ID: ");
-    p = append_hex64(p, request->request_id_high);
-    *p++ = '-';
-    *p = 0;
-    p = append_hex64(p, request->request_id_low);
-    p = append_str(p, "  RESULT: ");
-    p = append_str(p, ok ? "MATCH" : "NO");
-    p = append_str(p, "  CS: ");
-    p = append_hex64(p, request->result_cs);
-    p = append_str(p, "  TR: ");
-    append_hex64(p, request->result_tr);
+    if (has_terminal_reply) {
+        p = append_str(line, "AP REPLY ID: ");
+        p = append_hex64(p, request->reply.request_id_high);
+        *p++ = '-';
+        *p = 0;
+        p = append_hex64(p, request->reply.request_id_low);
+        p = append_str(p, "  RESULT: ");
+        p = append_dec(p, request->reply.result_code);
+        p = append_str(p, "  FAULT: ");
+        p = append_dec(p, request->reply.fault_code);
+        p = append_str(p, "  CS: ");
+        p = append_hex64(p, request->reply.result_cs);
+        p = append_str(p, "  TR: ");
+        append_hex64(p, request->reply.result_tr);
+    } else {
+        p = append_str(line, "AP REPLY: ");
+        p = append_str(p, ap_request_state_name(request->state));
+        p = append_str(p, "  RESULT: -  FAULT: ");
+        append_dec(p, request->reply.fault_code);
+    }
     draw_line(fb, 48, y, line, ok ? fg : warn, bg, 2);
 }
 
