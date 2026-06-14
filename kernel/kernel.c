@@ -50,6 +50,14 @@ typedef struct {
 #define VIBE_FAULT_TEST_UD2 1
 #define VIBE_FAULT_TEST_PF 2
 
+#ifndef VIBE_AP_FAULT_TEST
+#define VIBE_AP_FAULT_TEST 0
+#endif
+
+#define VIBE_AP_FAULT_TEST_NONE 0
+#define VIBE_AP_FAULT_TEST_UD2 1
+#define VIBE_AP_FAULT_TEST_PF 2
+
 #define KERNEL_CODE_SELECTOR 0x08
 #define KERNEL_DATA_SELECTOR 0x10
 #define KERNEL_TSS_SELECTOR 0x18
@@ -112,6 +120,7 @@ enum {
     AP_BOOT_STATE_SENT_SIPI = 3,
     AP_BOOT_STATE_ONLINE = 4,
     AP_BOOT_STATE_HALTED = 5,
+    AP_BOOT_STATE_FAULTED = 6,
 };
 
 enum {
@@ -119,6 +128,7 @@ enum {
     AP_ENTRY_STATE_C = 1,
     AP_ENTRY_STATE_TABLES = 2,
     AP_ENTRY_STATE_HALTED = 3,
+    AP_ENTRY_STATE_FAULT = 4,
 };
 
 static UINT32 color(framebuffer_t *fb, UINT8 r, UINT8 g, UINT8 b) {
@@ -356,6 +366,12 @@ typedef struct {
     volatile UINT64 ap_tr;
     volatile UINT64 ap_ist1;
     volatile UINT64 ap_ist2;
+    volatile UINT64 fault_vector;
+    volatile UINT64 fault_error_code;
+    volatile UINT64 fault_rip;
+    volatile UINT64 fault_cs;
+    volatile UINT64 fault_rflags;
+    volatile UINT64 fault_cr2;
     UINT32 target_acpi_uid;
     UINT32 target_apic_id;
     UINT32 sipi_vector;
@@ -386,6 +402,7 @@ typedef struct {
 } uuid128_t;
 
 static idt_entry_t idt[256];
+static idt_entry_t ap_idt[256];
 static cpu_local_t cpu0;
 static cpu_local_t cpu1;
 static cpu_local_t *current_cpu = &cpu0;
@@ -405,7 +422,13 @@ extern void isr_fault_df(void);
 extern void isr_fault_gp(void);
 extern void isr_fault_pf(void);
 extern void isr_unhandled(void);
+extern void isr_ap_fault_ud(void);
+extern void isr_ap_fault_df(void);
+extern void isr_ap_fault_gp(void);
+extern void isr_ap_fault_pf(void);
+extern void isr_ap_unhandled(void);
 void fault_dispatch(fault_frame_t *frame) __attribute__((noreturn));
+void ap_fault_dispatch(fault_frame_t *frame) __attribute__((noreturn));
 
 __asm__(
     ".text\n"
@@ -455,7 +478,39 @@ __asm__(
     "    cli\n"
     "1:\n"
     "    hlt\n"
-    "    jmp 1b\n");
+    "    jmp 1b\n"
+    ".global isr_ap_fault_ud\n"
+    "isr_ap_fault_ud:\n"
+    "    pushq $0\n"
+    "    pushq $6\n"
+    "    jmp isr_ap_fault_common\n"
+    ".global isr_ap_fault_df\n"
+    "isr_ap_fault_df:\n"
+    "    pushq $8\n"
+    "    jmp isr_ap_fault_common\n"
+    ".global isr_ap_fault_gp\n"
+    "isr_ap_fault_gp:\n"
+    "    pushq $13\n"
+    "    jmp isr_ap_fault_common\n"
+    ".global isr_ap_fault_pf\n"
+    "isr_ap_fault_pf:\n"
+    "    pushq $14\n"
+    "    jmp isr_ap_fault_common\n"
+    "isr_ap_fault_common:\n"
+    "    cld\n"
+    "    movq %rsp, %rdi\n"
+    "    andq $-16, %rsp\n"
+    "    call ap_fault_dispatch\n"
+    "4:\n"
+    "    cli\n"
+    "    hlt\n"
+    "    jmp 4b\n"
+    ".global isr_ap_unhandled\n"
+    "isr_ap_unhandled:\n"
+    "    cli\n"
+    "3:\n"
+    "    hlt\n"
+    "    jmp 3b\n");
 
 static void cpuid(UINT32 leaf, UINT32 subleaf, UINT32 *a, UINT32 *b, UINT32 *c, UINT32 *d) {
     __asm__ __volatile__(
@@ -1097,6 +1152,25 @@ void fault_dispatch(fault_frame_t *frame) {
     }
 }
 
+void ap_fault_dispatch(fault_frame_t *frame) {
+    __asm__ __volatile__("cli" : : : "memory");
+
+    ap_boot.fault_vector = frame->vector;
+    ap_boot.fault_error_code = frame->error_code;
+    ap_boot.fault_rip = frame->rip;
+    ap_boot.fault_cs = frame->cs;
+    ap_boot.fault_rflags = frame->rflags;
+    ap_boot.fault_cr2 = read_cr2();
+    ap_boot.entry_state = AP_ENTRY_STATE_FAULT;
+    ap_boot.ap_state = AP_BOOT_STATE_FAULTED;
+    __asm__ __volatile__("mfence" : : : "memory");
+    ap_boot.online = 1;
+
+    for (;;) {
+        __asm__ __volatile__("hlt" : : : "memory");
+    }
+}
+
 static UINT16 read_cs(void) {
     UINT16 cs;
     __asm__ __volatile__("mov %%cs, %0" : "=r"(cs));
@@ -1214,22 +1288,61 @@ static UINT64 isr_fault_pf_addr(void) {
     return addr;
 }
 
+static UINT64 isr_ap_unhandled_addr(void) {
+    UINT64 addr;
+    __asm__ __volatile__("leaq isr_ap_unhandled(%%rip), %0" : "=r"(addr));
+    return addr;
+}
+
+static UINT64 isr_ap_fault_ud_addr(void) {
+    UINT64 addr;
+    __asm__ __volatile__("leaq isr_ap_fault_ud(%%rip), %0" : "=r"(addr));
+    return addr;
+}
+
+static UINT64 isr_ap_fault_df_addr(void) {
+    UINT64 addr;
+    __asm__ __volatile__("leaq isr_ap_fault_df(%%rip), %0" : "=r"(addr));
+    return addr;
+}
+
+static UINT64 isr_ap_fault_gp_addr(void) {
+    UINT64 addr;
+    __asm__ __volatile__("leaq isr_ap_fault_gp(%%rip), %0" : "=r"(addr));
+    return addr;
+}
+
+static UINT64 isr_ap_fault_pf_addr(void) {
+    UINT64 addr;
+    __asm__ __volatile__("leaq isr_ap_fault_pf(%%rip), %0" : "=r"(addr));
+    return addr;
+}
+
+static void set_idt_gate_in(idt_entry_t *table, UINT32 vector, UINT64 addr, UINT16 selector,
+                            UINT8 ist, UINT8 type_attr) {
+    table[vector].offset_low = (UINT16)(addr & 0xffff);
+    table[vector].selector = selector;
+    table[vector].ist = ist & 0x7;
+    table[vector].type_attr = type_attr;
+    table[vector].offset_mid = (UINT16)((addr >> 16) & 0xffff);
+    table[vector].offset_high = (UINT32)(addr >> 32);
+    table[vector].zero = 0;
+}
+
 static void set_idt_gate(UINT32 vector, UINT64 addr, UINT16 selector, UINT8 ist, UINT8 type_attr) {
-    idt[vector].offset_low = (UINT16)(addr & 0xffff);
-    idt[vector].selector = selector;
-    idt[vector].ist = ist & 0x7;
-    idt[vector].type_attr = type_attr;
-    idt[vector].offset_mid = (UINT16)((addr >> 16) & 0xffff);
-    idt[vector].offset_high = (UINT32)(addr >> 32);
-    idt[vector].zero = 0;
+    set_idt_gate_in(idt, vector, addr, selector, ist, type_attr);
+}
+
+static void load_idt_entries(idt_entry_t *table) {
+    descriptor_table_ptr_t idtr;
+    idtr.limit = (UINT16)(sizeof(idt_entry_t) * 256 - 1);
+    idtr.base = (UINT64)(UINTN)table;
+
+    __asm__ __volatile__("cli; lidt %0" : : "m"(idtr) : "memory");
 }
 
 static void load_idt_table(void) {
-    descriptor_table_ptr_t idtr;
-    idtr.limit = (UINT16)(sizeof(idt) - 1);
-    idtr.base = (UINT64)(UINTN)idt;
-
-    __asm__ __volatile__("cli; lidt %0" : : "m"(idtr) : "memory");
+    load_idt_entries(idt);
 }
 
 static void store_idtr(descriptor_table_ptr_t *idtr) {
@@ -1252,6 +1365,28 @@ static void install_idt(void) {
     load_idt_table();
 }
 
+static void init_ap_idt(void) {
+    UINT64 unhandled_addr = isr_ap_unhandled_addr();
+
+    for (UINT32 vector = 0; vector < 256; vector++) {
+        set_idt_gate_in(ap_idt, vector, unhandled_addr, KERNEL_CODE_SELECTOR, 0, 0x8e);
+    }
+    set_idt_gate_in(ap_idt, 6, isr_ap_fault_ud_addr(), KERNEL_CODE_SELECTOR, CPU_IST_FAULT, 0x8e);
+    set_idt_gate_in(ap_idt, 8, isr_ap_fault_df_addr(), KERNEL_CODE_SELECTOR, CPU_IST_DOUBLE_FAULT, 0x8e);
+    set_idt_gate_in(ap_idt, 13, isr_ap_fault_gp_addr(), KERNEL_CODE_SELECTOR, CPU_IST_FAULT, 0x8e);
+    set_idt_gate_in(ap_idt, 14, isr_ap_fault_pf_addr(), KERNEL_CODE_SELECTOR, CPU_IST_FAULT, 0x8e);
+}
+
+static void run_ap_fault_test_if_enabled(void) {
+#if VIBE_AP_FAULT_TEST == VIBE_AP_FAULT_TEST_UD2
+    __asm__ __volatile__("ud2" : : : "memory");
+#elif VIBE_AP_FAULT_TEST == VIBE_AP_FAULT_TEST_PF
+    volatile UINT64 *unmapped = (volatile UINT64 *)(UINTN)(LOW_CANONICAL_LIMIT - PAGE_SIZE_4K);
+    volatile UINT64 value = *unmapped;
+    (void)value;
+#endif
+}
+
 static void ap_entry_one(void) __attribute__((noreturn));
 static void ap_entry_one(void) {
     descriptor_table_ptr_t gdtr;
@@ -1262,7 +1397,8 @@ static void ap_entry_one(void) {
 
     init_cpu_local(&cpu1, 1);
     load_cpu_tables(&cpu1);
-    load_idt_table();
+    init_ap_idt();
+    load_idt_entries(ap_idt);
 
     store_gdtr(&gdtr);
     store_idtr(&idtr);
@@ -1275,9 +1411,10 @@ static void ap_entry_one(void) {
                       gdtr.limit == (UINT16)(sizeof(cpu1.gdt) - 1)) ? 1U : 0U;
     ap_boot.tss_ok = (ap_boot.ap_tr == KERNEL_TSS_SELECTOR && cpu1.tss_ready &&
                       ap_boot.ap_ist1 != 0 && ap_boot.ap_ist2 != 0) ? 1U : 0U;
-    ap_boot.idt_ok = (idtr.base == (UINT64)(UINTN)idt &&
-                      idtr.limit == (UINT16)(sizeof(idt) - 1)) ? 1U : 0U;
+    ap_boot.idt_ok = (idtr.base == (UINT64)(UINTN)ap_idt &&
+                      idtr.limit == (UINT16)(sizeof(ap_idt) - 1)) ? 1U : 0U;
     ap_boot.entry_state = AP_ENTRY_STATE_TABLES;
+    run_ap_fault_test_if_enabled();
     ap_boot.ap_state = AP_BOOT_STATE_HALTED;
     ap_boot.entry_state = AP_ENTRY_STATE_HALTED;
     __asm__ __volatile__("mfence" : : : "memory");
@@ -1857,6 +1994,12 @@ static void bring_up_one_ap(ap_boot_info_t *boot, acpi_info_t *acpi, efi_memory_
     boot->ap_tr = 0;
     boot->ap_ist1 = 0;
     boot->ap_ist2 = 0;
+    boot->fault_vector = 0;
+    boot->fault_error_code = 0;
+    boot->fault_rip = 0;
+    boot->fault_cs = 0;
+    boot->fault_rflags = 0;
+    boot->fault_cr2 = 0;
     boot->wait_loops = 0;
     boot->icr_timeouts = 0;
 
@@ -1913,7 +2056,7 @@ static void bring_up_one_ap(ap_boot_info_t *boot, acpi_info_t *acpi, efi_memory_
 
     for (UINT32 i = 0; i < AP_ONLINE_TIMEOUT_LOOPS; i++) {
         if (boot->online) {
-            if (boot->ap_state != AP_BOOT_STATE_HALTED) {
+            if (boot->ap_state != AP_BOOT_STATE_HALTED && boot->ap_state != AP_BOOT_STATE_FAULTED) {
                 boot->ap_state = AP_BOOT_STATE_ONLINE;
             }
             boot->error = AP_BOOT_OK;
@@ -1950,6 +2093,7 @@ static const char *ap_boot_state_name(UINT32 state) {
     case AP_BOOT_STATE_SENT_SIPI: return "SENT-SIPI";
     case AP_BOOT_STATE_ONLINE: return "ONLINE";
     case AP_BOOT_STATE_HALTED: return "HALTED";
+    case AP_BOOT_STATE_FAULTED: return "FAULTED";
     default: return "UNKNOWN";
     }
 }
@@ -1960,6 +2104,7 @@ static const char *ap_entry_state_name(UINT32 state) {
     case AP_ENTRY_STATE_C: return "C";
     case AP_ENTRY_STATE_TABLES: return "TABLES";
     case AP_ENTRY_STATE_HALTED: return "HALTED";
+    case AP_ENTRY_STATE_FAULT: return "FAULT";
     default: return "UNKNOWN";
     }
 }
@@ -2007,6 +2152,26 @@ static void draw_ap_boot_info(framebuffer_t *fb, UINT32 *y, ap_boot_info_t *boot
     p = append_str(p, "  IST2: ");
     append_hex64(p, boot->ap_ist2);
     draw_line(fb, 48, y, line, fg, bg, 2);
+
+    if (boot->fault_vector != 0) {
+        p = append_str(line, "AP FAULT: ");
+        p = append_dec64(p, boot->fault_vector);
+        p = append_str(p, " ");
+        p = append_str(p, fault_vector_name(boot->fault_vector));
+        p = append_str(p, "  ERR: ");
+        p = append_hex64(p, boot->fault_error_code);
+        p = append_str(p, "  CR2: ");
+        append_hex64(p, boot->fault_cr2);
+        draw_line(fb, 48, y, line, warn, bg, 2);
+
+        p = append_str(line, "AP RIP: ");
+        p = append_hex64(p, boot->fault_rip);
+        p = append_str(p, "  CS: ");
+        p = append_hex64(p, boot->fault_cs);
+        p = append_str(p, "  RFLAGS: ");
+        append_hex64(p, boot->fault_rflags);
+        draw_line(fb, 48, y, line, warn, bg, 2);
+    }
 }
 
 static int draw_map_line(framebuffer_t *fb, UINT32 *y, const char *s, UINT32 fg, UINT32 bg) {
