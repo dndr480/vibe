@@ -190,6 +190,9 @@ typedef struct {
 #define AP_REQUEST_SLOT_COUNT 4U
 #define AP_REQUEST_SNAPSHOT_COUNT 4U
 #define AP_REQUEST_NO_SLOT 0xffffffffU
+#define AP_REQUEST_IPI_VECTOR 0xf1U
+#define AP_REQUEST_IPI_DRAIN_LOOPS 100000U
+#define LAPIC_SPURIOUS_VECTOR 0xffU
 
 enum {
     PAGING_OK = 0,
@@ -613,6 +616,8 @@ static cpu_local_t cpu0;
 static cpu_local_t cpu1;
 static cpu_local_t *current_cpu = &cpu0;
 static interrupt_trace_t interrupt_trace;
+static interrupt_trace_t ap_request_ipi_trace;
+static interrupt_trace_t spurious_interrupt_trace;
 static framebuffer_t kernel_framebuffer;
 static UINT32 kernel_bg;
 static UINT32 kernel_fg;
@@ -626,9 +631,17 @@ static ap_queue_summary_t ap_queue_summary;
 static volatile UINT32 ap_current_request_slot;
 static volatile UINT32 ap_request_handled_count;
 static volatile UINT32 ap_counter_value;
+static volatile UINT64 ap_lapic_base;
+static volatile UINT32 ap_bsp_apic_id;
+static volatile UINT32 ap_request_ipi_send_count;
+static volatile UINT32 ap_request_ipi_send_fail_count;
 static UINT8 ap_boot_stack[AP_BOOT_STACK_SIZE] __attribute__((aligned(16)));
 
 static int cmpxchg_u32(volatile UINT32 *ptr, UINT32 expected, UINT32 desired);
+static void enable_lapic_if_needed(UINT64 base);
+static int lapic_send_ipi(UINT64 base, UINT32 apic_id, UINT32 command, ap_boot_info_t *boot);
+static void ap_notify_bsp_request_complete(void);
+static UINT64 read_rflags(void);
 
 extern void isr_breakpoint(void);
 extern void isr_fault_ud(void);
@@ -636,6 +649,8 @@ extern void isr_fault_df(void);
 extern void isr_fault_gp(void);
 extern void isr_fault_pf(void);
 extern void isr_unhandled(void);
+extern void isr_ap_request_ipi(void);
+extern void isr_spurious_interrupt(void);
 extern void isr_ap_fault_ud(void);
 extern void isr_ap_fault_df(void);
 extern void isr_ap_fault_gp(void);
@@ -693,6 +708,41 @@ __asm__(
     "1:\n"
     "    hlt\n"
     "    jmp 1b\n"
+    ".global isr_ap_request_ipi\n"
+    "isr_ap_request_ipi:\n"
+    "    pushq %rax\n"
+    "    movq 8(%rsp), %rax\n"
+    "    movq %rax, ap_request_ipi_trace+8(%rip)\n"
+    "    movq 16(%rsp), %rax\n"
+    "    movq %rax, ap_request_ipi_trace+16(%rip)\n"
+    "    movq 24(%rsp), %rax\n"
+    "    movq %rax, ap_request_ipi_trace+24(%rip)\n"
+    "    movl $0xf1, ap_request_ipi_trace(%rip)\n"
+    "    movl ap_request_ipi_trace+4(%rip), %eax\n"
+    "    addl $1, %eax\n"
+    "    movl %eax, ap_request_ipi_trace+4(%rip)\n"
+    "    movq ap_lapic_base(%rip), %rax\n"
+    "    testq %rax, %rax\n"
+    "    jz 5f\n"
+    "    movl $0, 0xb0(%rax)\n"
+    "5:\n"
+    "    popq %rax\n"
+    "    iretq\n"
+    ".global isr_spurious_interrupt\n"
+    "isr_spurious_interrupt:\n"
+    "    pushq %rax\n"
+    "    movq 8(%rsp), %rax\n"
+    "    movq %rax, spurious_interrupt_trace+8(%rip)\n"
+    "    movq 16(%rsp), %rax\n"
+    "    movq %rax, spurious_interrupt_trace+16(%rip)\n"
+    "    movq 24(%rsp), %rax\n"
+    "    movq %rax, spurious_interrupt_trace+24(%rip)\n"
+    "    movl $0xff, spurious_interrupt_trace(%rip)\n"
+    "    movl spurious_interrupt_trace+4(%rip), %eax\n"
+    "    addl $1, %eax\n"
+    "    movl %eax, spurious_interrupt_trace+4(%rip)\n"
+    "    popq %rax\n"
+    "    iretq\n"
     ".global isr_ap_fault_ud\n"
     "isr_ap_fault_ud:\n"
     "    pushq $0\n"
@@ -1298,6 +1348,22 @@ static char *append_uuid128(char *p, uuid128_t uuid) {
     return append_hex64(p, uuid.low);
 }
 
+static void ap_notify_bsp_request_complete(void) {
+    UINT64 base = ap_lapic_base;
+    UINT32 apic_id = ap_bsp_apic_id;
+    if (base == 0) {
+        return;
+    }
+
+    __asm__ __volatile__("mfence" : : : "memory");
+    enable_lapic_if_needed(base);
+    if (lapic_send_ipi(base, apic_id, AP_REQUEST_IPI_VECTOR, &ap_boot)) {
+        ap_request_ipi_send_count = ap_request_ipi_send_count + 1U;
+    } else {
+        ap_request_ipi_send_fail_count = ap_request_ipi_send_fail_count + 1U;
+    }
+}
+
 void fault_dispatch(fault_frame_t *frame) {
     framebuffer_t *fb = &kernel_framebuffer;
     char line[192];
@@ -1425,6 +1491,7 @@ void ap_fault_dispatch(fault_frame_t *frame) {
     ap_boot.entry_state = AP_ENTRY_STATE_FAULT;
     ap_boot.ap_state = AP_BOOT_STATE_FAULTED;
     __asm__ __volatile__("mfence" : : : "memory");
+    ap_notify_bsp_request_complete();
     ap_boot.online = 1;
 
     for (;;) {
@@ -1436,6 +1503,12 @@ static UINT16 read_cs(void) {
     UINT16 cs;
     __asm__ __volatile__("mov %%cs, %0" : "=r"(cs));
     return cs;
+}
+
+static UINT64 read_rflags(void) {
+    UINT64 flags;
+    __asm__ __volatile__("pushfq; popq %0" : "=r"(flags) : : "memory");
+    return flags;
 }
 
 static void zero_memory(void *ptr, UINTN size) {
@@ -1522,6 +1595,18 @@ static UINT64 isr_breakpoint_addr(void) {
 static UINT64 isr_unhandled_addr(void) {
     UINT64 addr;
     __asm__ __volatile__("leaq isr_unhandled(%%rip), %0" : "=r"(addr));
+    return addr;
+}
+
+static UINT64 isr_ap_request_ipi_addr(void) {
+    UINT64 addr;
+    __asm__ __volatile__("leaq isr_ap_request_ipi(%%rip), %0" : "=r"(addr));
+    return addr;
+}
+
+static UINT64 isr_spurious_interrupt_addr(void) {
+    UINT64 addr;
+    __asm__ __volatile__("leaq isr_spurious_interrupt(%%rip), %0" : "=r"(addr));
     return addr;
 }
 
@@ -1622,6 +1707,8 @@ static void install_idt(void) {
     set_idt_gate(8, isr_fault_df_addr(), cs, CPU_IST_DOUBLE_FAULT, 0x8e);
     set_idt_gate(13, isr_fault_gp_addr(), cs, CPU_IST_FAULT, 0x8e);
     set_idt_gate(14, isr_fault_pf_addr(), cs, CPU_IST_FAULT, 0x8e);
+    set_idt_gate(AP_REQUEST_IPI_VECTOR, isr_ap_request_ipi_addr(), cs, 0, 0x8e);
+    set_idt_gate(LAPIC_SPURIOUS_VECTOR, isr_spurious_interrupt_addr(), cs, 0, 0x8e);
 
     load_idt_table();
 }
@@ -1890,6 +1977,7 @@ static void ap_request_loop(void) {
                 ap_boot.entry_state = AP_ENTRY_STATE_LOOP;
                 ap_queue_note_slot_terminal(i, AP_REQUEST_STATUS_DONE, AP_QUEUE_STOP_NONE);
                 complete_ap_request(slot, AP_REQUEST_STATUS_DONE);
+                ap_notify_bsp_request_complete();
                 ap_current_request_slot = AP_REQUEST_NO_SLOT;
             } else {
                 slot->reply.result_code = ap_dispatch_miss_result_code(slot->request.service_id,
@@ -1899,6 +1987,7 @@ static void ap_request_loop(void) {
                 ap_boot.entry_state = AP_ENTRY_STATE_HALTED;
                 ap_queue_note_slot_terminal(i, AP_REQUEST_STATUS_BAD_OP, AP_QUEUE_STOP_BAD_OP);
                 complete_ap_request(slot, AP_REQUEST_STATUS_BAD_OP);
+                ap_notify_bsp_request_complete();
                 ap_current_request_slot = AP_REQUEST_NO_SLOT;
                 for (;;) {
                     __asm__ __volatile__("cli; hlt" : : : "memory");
@@ -1967,8 +2056,15 @@ static int ap_request_batch_done(ap_request_slot_t *slots, UINTN count) {
     return 1;
 }
 
+static void drain_ap_request_ipis(void) {
+    for (UINT32 i = 0; i < AP_REQUEST_IPI_DRAIN_LOOPS; i++) {
+        __asm__ __volatile__("pause" : : : "memory");
+    }
+}
+
 static void wait_for_ap_requests(ap_request_slot_t *slots, UINTN count, ap_boot_info_t *boot) {
     UINT8 wait_recorded[AP_REQUEST_SLOT_COUNT];
+    UINT64 rflags = read_rflags();
     if (count > AP_REQUEST_SLOT_COUNT) {
         count = AP_REQUEST_SLOT_COUNT;
     }
@@ -1976,6 +2072,7 @@ static void wait_for_ap_requests(ap_request_slot_t *slots, UINTN count, ap_boot_
         wait_recorded[i] = 0;
     }
 
+    __asm__ __volatile__("sti" : : : "memory");
     for (UINT32 i = 0; i < AP_REQUEST_TIMEOUT_LOOPS; i++) {
         UINT32 all_finished = 1;
 
@@ -1992,7 +2089,7 @@ static void wait_for_ap_requests(ap_request_slot_t *slots, UINTN count, ap_boot_
         }
 
         if (all_finished) {
-            return;
+            break;
         }
 
         if (boot->ap_state == AP_BOOT_STATE_FAULTED) {
@@ -2010,7 +2107,7 @@ static void wait_for_ap_requests(ap_request_slot_t *slots, UINTN count, ap_boot_
                     slot->state = AP_REQUEST_STATUS_SKIPPED;
                 }
             }
-            return;
+            break;
         }
 
         if (boot->ap_state == AP_BOOT_STATE_HALTED) {
@@ -2024,6 +2121,10 @@ static void wait_for_ap_requests(ap_request_slot_t *slots, UINTN count, ap_boot_
             }
         }
         __asm__ __volatile__("pause" : : : "memory");
+    }
+    drain_ap_request_ipis();
+    if ((rflags & (1ULL << 9)) == 0) {
+        __asm__ __volatile__("cli" : : : "memory");
     }
 
     for (UINTN slot_index = 0; slot_index < count; slot_index++) {
@@ -2635,8 +2736,9 @@ static int lapic_send_ipi(UINT64 base, UINT32 apic_id, UINT32 command, ap_boot_i
 
 static void enable_lapic_if_needed(UINT64 base) {
     UINT32 svr = lapic_read32(base, 0x0f0);
-    if ((svr & (1U << 8)) == 0) {
-        lapic_write32(base, 0x0f0, (svr & 0xffffff00U) | 0x1ffU);
+    UINT32 desired = (svr & 0xffffff00U) | (1U << 8) | LAPIC_SPURIOUS_VECTOR;
+    if (svr != desired) {
+        lapic_write32(base, 0x0f0, desired);
     }
 }
 
@@ -2947,7 +3049,15 @@ static void draw_ap_queue_summary(framebuffer_t *fb, UINT32 *y, ap_queue_summary
     p = append_str(p, "  STOP: ");
     p = append_str(p, ap_queue_stop_reason_name(queue->stop_reason));
     p = append_str(p, "  CURRENT: ");
-    append_dec(p, queue->current_slot);
+    p = append_dec(p, queue->current_slot);
+    p = append_str(p, "  IPI RX/TX/FAIL: ");
+    p = append_dec(p, ap_request_ipi_trace.count);
+    *p++ = '/';
+    *p = 0;
+    p = append_dec(p, ap_request_ipi_send_count);
+    *p++ = '/';
+    *p = 0;
+    append_dec(p, ap_request_ipi_send_fail_count);
 
     UINT32 color = fg;
     if (queue->stop_reason == AP_QUEUE_STOP_DRAINED) {
@@ -3461,6 +3571,20 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE image, EFI_SYSTEM_TABLE *st) {
     ap_current_request_slot = AP_REQUEST_NO_SLOT;
     ap_request_handled_count = 0;
     ap_counter_value = 0;
+    ap_lapic_base = acpi.local_apic_base;
+    ap_bsp_apic_id = acpi.bsp_apic_id;
+    ap_request_ipi_trace.vector = 0;
+    ap_request_ipi_trace.count = 0;
+    ap_request_ipi_trace.rip = 0;
+    ap_request_ipi_trace.cs = 0;
+    ap_request_ipi_trace.rflags = 0;
+    spurious_interrupt_trace.vector = 0;
+    spurious_interrupt_trace.count = 0;
+    spurious_interrupt_trace.rip = 0;
+    spurious_interrupt_trace.cs = 0;
+    spurious_interrupt_trace.rflags = 0;
+    ap_request_ipi_send_count = 0;
+    ap_request_ipi_send_fail_count = 0;
     bring_up_one_ap(&ap_boot, &acpi, &memory_map, &paging);
     const ap_request_plan_t ap_first_batch_plan[AP_REQUEST_SLOT_COUNT] = {
         {VIBE_AP_FIRST_REQUEST_OPCODE, VIBE_AP_FIRST_REQUEST_SERVICE_ID,
