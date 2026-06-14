@@ -1551,13 +1551,6 @@ static void ap_handle_ping_request(ap_request_slot_t *slot) {
     slot->metrics.handled_count = slot->metrics.handled_count + 1U;
 }
 
-static void ap_halt_after_request(void) __attribute__((noreturn));
-static void ap_halt_after_request(void) {
-    for (;;) {
-        __asm__ __volatile__("cli; hlt" : : : "memory");
-    }
-}
-
 static void ap_request_loop(void) __attribute__((noreturn));
 static void ap_request_loop(void) {
     ap_boot.ap_state = AP_BOOT_STATE_ONLINE;
@@ -1578,8 +1571,8 @@ static void ap_request_loop(void) {
 
             if (ap_request.request.opcode == AP_REQUEST_OP_PING) {
                 ap_handle_ping_request(&ap_request);
-                ap_boot.ap_state = AP_BOOT_STATE_HALTED;
-                ap_boot.entry_state = AP_ENTRY_STATE_HALTED;
+                ap_boot.ap_state = AP_BOOT_STATE_ONLINE;
+                ap_boot.entry_state = AP_ENTRY_STATE_LOOP;
                 complete_ap_request(AP_REQUEST_STATUS_DONE);
             } else {
                 ap_request.reply.result_code = ap_request.request.opcode;
@@ -1587,8 +1580,10 @@ static void ap_request_loop(void) {
                 ap_boot.ap_state = AP_BOOT_STATE_HALTED;
                 ap_boot.entry_state = AP_ENTRY_STATE_HALTED;
                 complete_ap_request(AP_REQUEST_STATUS_BAD_OP);
+                for (;;) {
+                    __asm__ __volatile__("cli; hlt" : : : "memory");
+                }
             }
-            ap_halt_after_request();
         }
         __asm__ __volatile__("pause" : : : "memory");
     }
@@ -2958,7 +2953,7 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE image, EFI_SYSTEM_TABLE *st) {
     reset_ap_request_slot(&ap_request);
     bring_up_one_ap(&ap_boot, &acpi, &memory_map, &paging);
     send_ap_ping_request(&ap_request, &ap_boot, 1, 0);
-    if (ap_request.state == AP_REQUEST_STATUS_DONE && ap_boot.ap_state == AP_BOOT_STATE_HALTED) {
+    if (ap_request.state == AP_REQUEST_STATUS_DONE && ap_boot.ap_state != AP_BOOT_STATE_FAULTED) {
         send_ap_ping_request(&ap_request, &ap_boot, 2, 1);
     }
 
