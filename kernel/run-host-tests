@@ -1,0 +1,22 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+build_dir="$script_dir/build/host-tests"
+
+mkdir -p "$build_dir"
+
+printf '==> building host AP service tests\n'
+gcc \
+  -std=c11 \
+  -Wall \
+  -Wextra \
+  -Werror \
+  -I"$script_dir" \
+  -DVIBE_AP_REQUEST_FAULT_TEST=0 \
+  "$script_dir/ap_services.c" \
+  "$script_dir/tests/test_ap_services.c" \
+  -o "$build_dir/test_ap_services"
+
+printf '==> running host AP service tests\n'
+"$build_dir/test_ap_services"
