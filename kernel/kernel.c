@@ -686,7 +686,7 @@ typedef struct {
 } fault_frame_t;
 
 static idt_entry_t bsp_idt[256];
-static cpu_local_t cpu0;
+static cpu_local_t bsp_cpu;
 static bsp_interrupt_observe_t bsp_interrupt_observe;
 static system_interrupt_observe_t system_interrupt_observe;
 static framebuffer_t kernel_framebuffer;
@@ -1547,7 +1547,7 @@ void fault_dispatch(fault_frame_t *frame) {
     append_hex64(p, read_cr3());
     draw_line(fb, 48, &y, line, kernel_fg, kernel_bg, 2);
 
-    cpu_local_t *cpu = &cpu0;
+    cpu_local_t *cpu = &bsp_cpu;
     p = append_str(line, "CPU: ");
     p = append_dec(p, cpu ? cpu->id : 0);
     p = append_str(p, "  TR: ");
@@ -3960,8 +3960,8 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE image, EFI_SYSTEM_TABLE *st) {
     kernel_fg = fg;
     kernel_accent = accent;
     kernel_warn = warn;
-    init_cpu_local(&cpu0, 0);
-    install_cpu_tables(&cpu0);
+    init_cpu_local(&bsp_cpu, 0);
+    install_cpu_tables(&bsp_cpu);
     install_bsp_idt();
 
     paging_info_t paging;
