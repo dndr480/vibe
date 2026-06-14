@@ -115,6 +115,7 @@ typedef struct {
 #define AP_TRAMPOLINE_PROT32_SELECTOR 0x18
 #define AP_ONLINE_TIMEOUT_LOOPS 100000000U
 #define AP_REQUEST_TIMEOUT_LOOPS 100000000U
+#define AP_REQUEST_SNAPSHOT_COUNT 2U
 
 enum {
     PAGING_OK = 0,
@@ -484,6 +485,12 @@ typedef struct {
 } ap_request_slot_t;
 
 typedef struct {
+    ap_request_slot_t request;
+    UINT32 counter_value;
+    UINT32 valid;
+} ap_request_snapshot_t;
+
+typedef struct {
     volatile UINT32 vector;
     volatile UINT32 count;
     volatile UINT64 rip;
@@ -518,6 +525,7 @@ static UINT32 kernel_warn;
 static uuid128_t current_request_uuid;
 static ap_boot_info_t ap_boot;
 static ap_request_slot_t ap_request;
+static ap_request_snapshot_t ap_request_snapshots[AP_REQUEST_SNAPSHOT_COUNT];
 static volatile UINT32 ap_counter_value;
 static UINT8 ap_boot_stack[AP_BOOT_STACK_SIZE] __attribute__((aligned(16)));
 
@@ -1549,6 +1557,46 @@ static void reset_ap_request_slot(ap_request_slot_t *slot) {
     slot->metrics.wait_loops = 0;
 }
 
+static void copy_ap_request_slot(ap_request_slot_t *dst, ap_request_slot_t *src) {
+    dst->state = src->state;
+    dst->request.source_cpu = src->request.source_cpu;
+    dst->request.target_cpu = src->request.target_cpu;
+    dst->request.opcode = src->request.opcode;
+    dst->request.sequence = src->request.sequence;
+    dst->request.service_id = src->request.service_id;
+    dst->request.interface_id = src->request.interface_id;
+    dst->request.id_high = src->request.id_high;
+    dst->request.id_low = src->request.id_low;
+    dst->reply.result_code = src->reply.result_code;
+    dst->reply.fault_code = src->reply.fault_code;
+    dst->reply.request_id_high = src->reply.request_id_high;
+    dst->reply.request_id_low = src->reply.request_id_low;
+    dst->reply.result_cs = src->reply.result_cs;
+    dst->reply.result_tr = src->reply.result_tr;
+    dst->metrics.handled_count = src->metrics.handled_count;
+    dst->metrics.wait_loops = src->metrics.wait_loops;
+}
+
+static void reset_ap_request_snapshots(void) {
+    for (UINTN i = 0; i < AP_REQUEST_SNAPSHOT_COUNT; i++) {
+        reset_ap_request_slot(&ap_request_snapshots[i].request);
+        ap_request_snapshots[i].counter_value = 0;
+        ap_request_snapshots[i].valid = 0;
+    }
+}
+
+static void snapshot_ap_request(UINTN index, ap_request_slot_t *slot) {
+    if (index >= AP_REQUEST_SNAPSHOT_COUNT) {
+        return;
+    }
+
+    __asm__ __volatile__("mfence" : : : "memory");
+    copy_ap_request_slot(&ap_request_snapshots[index].request, slot);
+    ap_request_snapshots[index].counter_value = ap_counter_value;
+    ap_request_snapshots[index].valid = 1;
+    __asm__ __volatile__("mfence" : : : "memory");
+}
+
 static int cmpxchg_u32(volatile UINT32 *ptr, UINT32 expected, UINT32 desired) {
     UINT8 success;
     __asm__ __volatile__(
@@ -1694,7 +1742,7 @@ static void send_ap_request(ap_request_slot_t *slot, ap_boot_info_t *boot, UINT3
     UINT32 handled_count = keep_handled_count ? slot->metrics.handled_count : 0;
 
     reset_ap_request_slot(slot);
-    slot->metrics.handled_count = handled_count;
+    prepare_ap_request(slot, opcode, service_id, interface_id, sequence, handled_count);
     if (boot->ap_state == AP_BOOT_STATE_FAULTED) {
         slot->reply.fault_code = (UINT32)boot->fault_vector;
         slot->state = AP_REQUEST_STATUS_FAULT;
@@ -1705,7 +1753,6 @@ static void send_ap_request(ap_request_slot_t *slot, ap_boot_info_t *boot, UINT3
         return;
     }
 
-    prepare_ap_request(slot, opcode, service_id, interface_id, sequence, handled_count);
     if (boot->ap_state == AP_BOOT_STATE_HALTED) {
         slot->state = AP_REQUEST_STATUS_SKIPPED;
         return;
@@ -2493,7 +2540,7 @@ static const char *ap_request_op_name(UINT32 opcode) {
     }
 }
 
-static int ap_request_result_ok(ap_request_slot_t *request) {
+static int ap_request_result_ok(ap_request_slot_t *request, UINT32 counter_value) {
     if (request->state != AP_REQUEST_STATUS_DONE ||
         request->reply.fault_code != 0 ||
         request->request.id_high != request->reply.request_id_high ||
@@ -2510,8 +2557,8 @@ static int ap_request_result_ok(ap_request_slot_t *request) {
     if (request->request.service_id == AP_REQUEST_SERVICE_COUNTER &&
         request->request.interface_id == AP_REQUEST_INTERFACE_COUNTER_INCREMENT) {
         return request->request.opcode == AP_REQUEST_OP_COUNTER &&
-               request->reply.result_code == ap_counter_value &&
-               ap_counter_value > 0;
+               request->reply.result_code == counter_value &&
+               counter_value > 0;
     }
 
     return 0;
@@ -2606,17 +2653,20 @@ static void draw_ap_boot_info(framebuffer_t *fb, UINT32 *y, ap_boot_info_t *boot
 }
 
 static void draw_ap_request_info(framebuffer_t *fb, UINT32 *y, ap_request_slot_t *request,
-                                 UINT32 fg, UINT32 accent, UINT32 warn, UINT32 bg) {
+                                 UINT32 request_number, UINT32 counter_value, UINT32 fg,
+                                 UINT32 accent, UINT32 warn, UINT32 bg) {
     char line[192];
     char *p;
-    int ok = ap_request_result_ok(request);
+    int ok = ap_request_result_ok(request, counter_value);
     int has_reply_id = request->reply.request_id_high != 0 || request->reply.request_id_low != 0;
     int has_terminal_reply = has_reply_id &&
                              (request->state == AP_REQUEST_STATUS_DONE ||
                               request->state == AP_REQUEST_STATUS_BAD_OP ||
                               request->state == AP_REQUEST_STATUS_FAULT);
 
-    p = append_str(line, "AP REQUEST: ");
+    p = append_str(line, "AP REQUEST ");
+    p = append_dec(p, request_number);
+    p = append_str(p, ": ");
     p = append_str(p, ap_request_op_name(request->request.opcode));
     p = append_str(p, ok ? " OK" : " NOT-OK");
     p = append_str(p, "  STATE: ");
@@ -2663,6 +2713,25 @@ static void draw_ap_request_info(framebuffer_t *fb, UINT32 *y, ap_request_slot_t
     draw_line(fb, 48, y, line, ok ? fg : warn, bg, 2);
 }
 
+static void draw_ap_request_snapshots(framebuffer_t *fb, UINT32 *y,
+                                      ap_request_snapshot_t *snapshots, UINTN count,
+                                      UINT32 fg, UINT32 accent, UINT32 warn, UINT32 bg) {
+    UINT32 drawn = 0;
+
+    for (UINTN i = 0; i < count; i++) {
+        if (!snapshots[i].valid) {
+            continue;
+        }
+        draw_ap_request_info(fb, y, &snapshots[i].request, (UINT32)(i + 1),
+                             snapshots[i].counter_value, fg, accent, warn, bg);
+        drawn++;
+    }
+
+    if (!drawn) {
+        draw_line(fb, 48, y, "AP REQUESTS: NONE", warn, bg, 2);
+    }
+}
+
 static int draw_map_line(framebuffer_t *fb, UINT32 *y, const char *s, UINT32 fg, UINT32 bg) {
     if (*y + 20 > fb->height) {
         return 0;
@@ -2687,7 +2756,8 @@ static UINT32 memory_line_color(EFI_MEMORY_DESCRIPTOR *desc, UINT32 fg, UINT32 m
 }
 
 static void draw_memory_map(framebuffer_t *fb, efi_memory_map_t *map, paging_info_t *paging,
-                            acpi_info_t *acpi, ap_boot_info_t *ap, ap_request_slot_t *request,
+                            acpi_info_t *acpi, ap_boot_info_t *ap,
+                            ap_request_snapshot_t *request_snapshots, UINTN request_snapshot_count,
                             UINT32 fg, UINT32 muted, UINT32 accent, UINT32 warn, UINT32 bg) {
     UINT64 conventional_pages = 0;
     UINT64 loader_pages = 0;
@@ -2780,8 +2850,9 @@ static void draw_memory_map(framebuffer_t *fb, efi_memory_map_t *map, paging_inf
 
     if (ap) {
         draw_ap_boot_info(fb, &y, ap, fg, accent, warn, bg);
-        if (request) {
-            draw_ap_request_info(fb, &y, request, fg, accent, warn, bg);
+        if (request_snapshots) {
+            draw_ap_request_snapshots(fb, &y, request_snapshots, request_snapshot_count,
+                                      fg, accent, warn, bg);
         }
         y += 8;
     }
@@ -3075,17 +3146,22 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE image, EFI_SYSTEM_TABLE *st) {
     acpi_info_t acpi;
     parse_acpi(acpi_rsdp, &memory_map, &acpi);
     reset_ap_request_slot(&ap_request);
+    reset_ap_request_snapshots();
     ap_counter_value = 0;
     bring_up_one_ap(&ap_boot, &acpi, &memory_map, &paging);
     send_ap_request(&ap_request, &ap_boot, VIBE_AP_FIRST_REQUEST_OPCODE,
                     VIBE_AP_FIRST_REQUEST_SERVICE_ID, VIBE_AP_FIRST_REQUEST_INTERFACE_ID, 1, 0);
+    snapshot_ap_request(0, &ap_request);
     if (ap_request.state == AP_REQUEST_STATUS_DONE && ap_boot.ap_state != AP_BOOT_STATE_FAULTED) {
         send_ap_request(&ap_request, &ap_boot, VIBE_AP_SECOND_REQUEST_OPCODE,
                         VIBE_AP_SECOND_REQUEST_SERVICE_ID, VIBE_AP_SECOND_REQUEST_INTERFACE_ID, 2, 1);
+        snapshot_ap_request(1, &ap_request);
     }
 
     clear_screen(&fb, bg);
-    draw_memory_map(&fb, &memory_map, &paging, &acpi, &ap_boot, &ap_request, fg, muted, accent, warn, bg);
+    draw_memory_map(&fb, &memory_map, &paging, &acpi, &ap_boot,
+                    ap_request_snapshots, AP_REQUEST_SNAPSHOT_COUNT,
+                    fg, muted, accent, warn, bg);
     run_fault_test_if_enabled();
 
     halt_forever();
