@@ -187,6 +187,8 @@ typedef struct {
 #define AP_REQUEST_SLOT_COUNT 4U
 #define AP_REQUEST_HISTORY_COUNT 8U
 #define AP_REQUEST_NO_SLOT 0xffffffffU
+#define AP_BROADCAST_PING_SLOT_INDEX 0U
+#define AP_BROADCAST_PING_SEQUENCE_BASE 0xb000U
 #define AP_REQUEST_KICK_IPI_VECTOR 0xf0U
 #define AP_REQUEST_IPI_VECTOR 0xf1U
 #define AP_IDLE_TIMER_VECTOR 0xf2U
@@ -542,6 +544,23 @@ typedef struct {
 } ap_queue_summary_t;
 
 typedef struct {
+    UINT32 valid;
+    UINT32 apic_id;
+    UINT32 state;
+    UINT32 result_code;
+    UINT32 fault_code;
+    UINT32 wait_loops;
+} ap_broadcast_ping_entry_t;
+
+typedef struct {
+    UINT32 planned_count;
+    UINT32 completed_count;
+    UINT32 ok_count;
+    UINT32 fail_count;
+    ap_broadcast_ping_entry_t entries[MAX_AP_CONTEXTS];
+} ap_broadcast_ping_summary_t;
+
+typedef struct {
     volatile UINT32 vector;
     volatile UINT32 count;
     volatile UINT64 rip;
@@ -640,6 +659,7 @@ static bsp_context_t bsp_context;
 static bsp_interrupt_observe_t bsp_interrupt_observe;
 static system_interrupt_observe_t system_interrupt_observe;
 static bsp_fault_display_t bsp_fault_display;
+static ap_broadcast_ping_summary_t ap_broadcast_ping_summary;
 static ap_context_t ap_contexts[MAX_AP_CONTEXTS];
 static ap_context_t *ap_request_target_context = &ap_contexts[0];
 static ap_interrupt_observe_t *ap_request_interrupts __attribute__((used)) = &ap_contexts[0].interrupts;
@@ -2195,7 +2215,8 @@ static void prepare_ap_request(ap_request_slot_t *slot, UINT32 target_cpu, UINT3
 }
 
 static void publish_ap_request(ap_context_t *ctx, ap_request_slot_t *slot, UINT32 opcode,
-                               UINT64 service_id, UINT64 interface_id, UINT32 sequence) {
+                               UINT64 service_id, UINT64 interface_id, UINT32 sequence,
+                               int send_kick) {
     ap_boot_info_t *boot = &ctx->boot;
     reset_ap_request_slot(slot);
     prepare_ap_request(slot, ap_context_index(ctx) + 1U, opcode, service_id,
@@ -2218,7 +2239,9 @@ static void publish_ap_request(ap_context_t *ctx, ap_request_slot_t *slot, UINT3
     __asm__ __volatile__("mfence" : : : "memory");
     slot->state = AP_REQUEST_STATUS_PENDING;
     __asm__ __volatile__("mfence" : : : "memory");
-    bsp_notify_ap_request_pending(ctx);
+    if (send_kick) {
+        bsp_notify_ap_request_pending(ctx);
+    }
 }
 
 static int ap_request_all_done(ap_request_slot_t *slots, UINTN count) {
@@ -2260,7 +2283,7 @@ static void publish_ap_stream_slot(ap_context_t *ctx, ap_request_slot_t *slots, 
                                    UINTN slot_index,
                                    const ap_request_plan_t *plan) {
     publish_ap_request(ctx, &slots[slot_index], plan->opcode, plan->service_id,
-                       plan->interface_id, plan->sequence);
+                       plan->interface_id, plan->sequence, 1);
     active[slot_index] = 1;
 }
 
@@ -2448,6 +2471,154 @@ static int run_ap_request_stream(ap_context_t *ctx, const ap_request_plan_t *pla
 
     finish_timed_out_ap_stream_slots(ctx, slots, count, active, &counter_base, &completed_count);
     return completed_count == plan_count && ap_request_all_done(slots, count);
+}
+
+static void reset_ap_broadcast_ping_summary(void) {
+    zero_memory(&ap_broadcast_ping_summary, sizeof(ap_broadcast_ping_summary));
+}
+
+static int ap_context_can_accept_broadcast_ping(ap_context_t *ctx) {
+    ap_boot_info_t *boot = &ctx->boot;
+    return boot->error == AP_BOOT_OK &&
+           boot->online &&
+           boot->ap_state != AP_BOOT_STATE_HALTED &&
+           boot->ap_state != AP_BOOT_STATE_FAULTED;
+}
+
+static int ap_broadcast_ping_result_ok(ap_request_slot_t *slot) {
+    return slot->state == AP_REQUEST_STATUS_DONE &&
+           slot->request.opcode == AP_REQUEST_OP_PING &&
+           slot->request.service_id == AP_REQUEST_SERVICE_PING &&
+           slot->request.interface_id == AP_REQUEST_INTERFACE_PING &&
+           slot->reply.result_code == 0 &&
+           slot->reply.fault_code == 0 &&
+           slot->request.id_high == slot->reply.request_id_high &&
+           slot->request.id_low == slot->reply.request_id_low;
+}
+
+static void record_ap_broadcast_ping_result(UINTN index, ap_context_t *ctx,
+                                            ap_request_slot_t *slot, UINT32 wait_loops) {
+    if (index >= MAX_AP_CONTEXTS) {
+        return;
+    }
+
+    ap_broadcast_ping_entry_t *entry = &ap_broadcast_ping_summary.entries[index];
+    entry->valid = 1;
+    entry->apic_id = ctx->boot.target_apic_id;
+    entry->state = slot->state;
+    entry->result_code = slot->reply.result_code;
+    entry->fault_code = slot->reply.fault_code;
+    entry->wait_loops = wait_loops;
+    ap_broadcast_ping_summary.completed_count++;
+    if (ap_broadcast_ping_result_ok(slot)) {
+        ap_broadcast_ping_summary.ok_count++;
+    } else {
+        ap_broadcast_ping_summary.fail_count++;
+    }
+}
+
+static void timeout_ap_broadcast_ping_slot(ap_request_slot_t *slot) {
+    slot->metrics.wait_loops = AP_REQUEST_TIMEOUT_LOOPS;
+    if (!ap_request_state_finished(slot->state)) {
+        if (!cmpxchg_u32(&slot->state, AP_REQUEST_STATUS_PENDING, AP_REQUEST_STATUS_TIMEOUT)) {
+            (void)cmpxchg_u32(&slot->state, AP_REQUEST_STATUS_RUNNING, AP_REQUEST_STATUS_TIMEOUT);
+        }
+    }
+}
+
+static void reset_ap_request_transport_observe(ap_context_t *ctx) {
+    zero_memory((void *)&ctx->interrupts.kick_ipi, sizeof(ctx->interrupts.kick_ipi));
+    zero_memory((void *)&ctx->interrupts.completion_ipi, sizeof(ctx->interrupts.completion_ipi));
+    ctx->request_kick_ipi_send_count = 0;
+    ctx->request_kick_ipi_send_fail_count = 0;
+    ctx->request_ipi_send_count = 0;
+    ctx->request_ipi_send_fail_count = 0;
+}
+
+static void run_ap_broadcast_ping(ap_context_t *contexts, UINTN context_count,
+                                  ap_context_t *request_target) {
+    UINT8 active[MAX_AP_CONTEXTS];
+    UINT32 target_handled_count = request_target ? request_target->request_handled_count : 0;
+    UINT32 target_counter_value = request_target ? request_target->counter_value : 0;
+    UINTN active_count = 0;
+    UINT64 rflags = read_rflags();
+
+    reset_ap_broadcast_ping_summary();
+    if (context_count > MAX_AP_CONTEXTS) {
+        context_count = MAX_AP_CONTEXTS;
+    }
+
+    for (UINTN i = 0; i < MAX_AP_CONTEXTS; i++) {
+        active[i] = 0;
+    }
+
+    for (UINTN i = 0; i < context_count; i++) {
+        ap_context_t *ctx = &contexts[i];
+        if (!ap_context_can_accept_broadcast_ping(ctx)) {
+            continue;
+        }
+
+        ap_request_slot_t *slot = &ctx->request_slots[AP_BROADCAST_PING_SLOT_INDEX];
+        publish_ap_request(ctx, slot, AP_REQUEST_OP_PING, AP_REQUEST_SERVICE_PING,
+                           AP_REQUEST_INTERFACE_PING,
+                           AP_BROADCAST_PING_SEQUENCE_BASE + (UINT32)i, 0);
+        active[i] = 1;
+        active_count++;
+        ap_broadcast_ping_summary.planned_count++;
+    }
+
+    __asm__ __volatile__("cli" : : : "memory");
+    UINT32 wait_loops = 0;
+    while (active_count > 0 && wait_loops < AP_REQUEST_TIMEOUT_LOOPS) {
+        for (UINTN i = 0; i < context_count; i++) {
+            if (!active[i]) {
+                continue;
+            }
+
+            ap_request_slot_t *slot = &contexts[i].request_slots[AP_BROADCAST_PING_SLOT_INDEX];
+            if (!ap_request_state_finished(slot->state)) {
+                continue;
+            }
+
+            slot->metrics.wait_loops = wait_loops;
+            record_ap_broadcast_ping_result(i, &contexts[i], slot, wait_loops);
+            active[i] = 0;
+            active_count--;
+        }
+
+        if (active_count == 0) {
+            break;
+        }
+
+        wait_loops = advance_ap_request_wait_loops(wait_loops,
+                                                   bsp_wait_for_ap_request_event());
+    }
+
+    if (active_count > 0) {
+        for (UINTN i = 0; i < context_count; i++) {
+            if (!active[i]) {
+                continue;
+            }
+
+            ap_request_slot_t *slot = &contexts[i].request_slots[AP_BROADCAST_PING_SLOT_INDEX];
+            timeout_ap_broadcast_ping_slot(slot);
+            record_ap_broadcast_ping_result(i, &contexts[i], slot, AP_REQUEST_TIMEOUT_LOOPS);
+            active[i] = 0;
+        }
+    }
+
+    bsp_disarm_wait_timer();
+    __asm__ __volatile__("sti" : : : "memory");
+    drain_ap_request_ipis();
+    if ((rflags & (1ULL << 9)) == 0) {
+        __asm__ __volatile__("cli" : : : "memory");
+    }
+
+    if (request_target) {
+        request_target->request_handled_count = target_handled_count;
+        request_target->counter_value = target_counter_value;
+        reset_ap_request_transport_observe(request_target);
+    }
 }
 
 static void init_ap_context(ap_context_t *ctx, ap_boot_info_t *trampoline_boot,
@@ -3601,6 +3772,45 @@ static void draw_ap_context_summary(framebuffer_t *fb, UINT32 *y, ap_context_t *
     draw_line(fb, 48, y, line, color ? color : fg, bg, 2);
 }
 
+static void draw_ap_broadcast_ping_summary(framebuffer_t *fb, UINT32 *y, UINT32 fg,
+                                           UINT32 accent, UINT32 warn, UINT32 bg) {
+    ap_broadcast_ping_summary_t *summary = &ap_broadcast_ping_summary;
+    char line[256];
+    char *p = append_str(line, "AP BCAST PING: OK ");
+    p = append_dec(p, summary->ok_count);
+    *p++ = '/';
+    *p = 0;
+    p = append_dec(p, summary->planned_count);
+    p = append_str(p, "  FAIL: ");
+    p = append_dec(p, summary->fail_count);
+    p = append_str(p, "  APIC:");
+    if (summary->planned_count == 0) {
+        p = append_str(p, " NONE");
+    }
+
+    for (UINTN i = 0; i < MAX_AP_CONTEXTS; i++) {
+        ap_broadcast_ping_entry_t *entry = &summary->entries[i];
+        if (!entry->valid) {
+            continue;
+        }
+
+        int ok = entry->state == AP_REQUEST_STATUS_DONE &&
+                 entry->result_code == 0 &&
+                 entry->fault_code == 0;
+        *p++ = ' ';
+        *p = 0;
+        p = append_dec(p, entry->apic_id);
+        *p++ = ':';
+        *p = 0;
+        p = append_str(p, ok ? "OK" : "FAIL");
+    }
+
+    UINT32 color = (summary->planned_count > 0 &&
+                    summary->completed_count == summary->planned_count &&
+                    summary->fail_count == 0) ? accent : warn;
+    draw_line(fb, 48, y, line, color ? color : fg, bg, 2);
+}
+
 static void draw_memory_map(framebuffer_t *fb, efi_memory_map_t *map, paging_info_t *paging,
                             acpi_info_t *acpi, ap_context_t *target_context,
                             ap_context_t *ap_contexts, UINTN ap_context_count,
@@ -3699,6 +3909,7 @@ static void draw_memory_map(framebuffer_t *fb, efi_memory_map_t *map, paging_inf
             draw_ap_context_summary(fb, &y, ap_contexts, ap_context_count, target_context,
                                     fg, accent, warn, bg);
         }
+        draw_ap_broadcast_ping_summary(fb, &y, fg, accent, warn, bg);
         draw_ap_boot_info(fb, &y, &target_context->boot, fg, accent, warn, bg);
         draw_ap_queue_summary(fb, &y, target_context, fg, accent, warn, bg);
         draw_ap_kick_summary(fb, &y, target_context, fg, accent, warn, bg);
@@ -4011,6 +4222,7 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE image, EFI_SYSTEM_TABLE *st) {
             bring_up_one_ap(&ap_contexts[i], i, &acpi, &memory_map, &paging);
         }
     }
+    run_ap_broadcast_ping(ap_contexts, ap_context_count, request_target);
     const ap_request_plan_t ap_request_plan[] = {
         {VIBE_AP_FIRST_REQUEST_OPCODE, VIBE_AP_FIRST_REQUEST_SERVICE_ID,
          VIBE_AP_FIRST_REQUEST_INTERFACE_ID, 1},
