@@ -165,6 +165,7 @@ typedef struct {
 
 #define VIBE_AP_REQUEST_FAULT_TEST_NONE 0
 #define VIBE_AP_REQUEST_FAULT_TEST_UD2 1
+#define VIBE_AP_REQUEST_FAULT_TEST_HANG 2
 
 #define KERNEL_CODE_SELECTOR 0x08
 #define KERNEL_DATA_SELECTOR 0x10
@@ -186,7 +187,9 @@ typedef struct {
 #define AP_TRAMPOLINE_GDT_OFFSET 0x190U
 #define AP_TRAMPOLINE_PROT32_SELECTOR 0x18
 #define AP_ONLINE_TIMEOUT_LOOPS 100000000U
+#ifndef AP_REQUEST_TIMEOUT_LOOPS
 #define AP_REQUEST_TIMEOUT_LOOPS 100000000U
+#endif
 #define AP_REQUEST_SLOT_COUNT 4U
 #define AP_REQUEST_HISTORY_COUNT 8U
 #define AP_REQUEST_NO_SLOT 0xffffffffU
@@ -196,7 +199,9 @@ typedef struct {
 #define AP_IDLE_TIMER_INITIAL_COUNT 1000000U
 #define BSP_WAIT_TIMER_VECTOR 0xf3U
 #define BSP_WAIT_TIMER_INITIAL_COUNT 1000000U
+#ifndef BSP_WAIT_TIMER_TIMEOUT_STEP
 #define BSP_WAIT_TIMER_TIMEOUT_STEP 100000U
+#endif
 #define AP_REQUEST_IPI_DRAIN_LOOPS 100000U
 #define LAPIC_SPURIOUS_VECTOR 0xffU
 #define LAPIC_LVT_MASKED (1U << 16)
@@ -1999,10 +2004,26 @@ static void complete_ap_request(ap_request_slot_t *slot, UINT32 state) {
     __asm__ __volatile__("mfence" : : : "memory");
 }
 
-static void ap_handle_ping_request(ap_request_slot_t *slot) {
+static void run_ap_request_test_hook(int hang_enabled) {
 #if VIBE_AP_REQUEST_FAULT_TEST == VIBE_AP_REQUEST_FAULT_TEST_UD2
+    (void)hang_enabled;
     __asm__ __volatile__("ud2" : : : "memory");
+#elif VIBE_AP_REQUEST_FAULT_TEST == VIBE_AP_REQUEST_FAULT_TEST_HANG
+    if (!hang_enabled) {
+        return;
+    }
+
+    __asm__ __volatile__("cli" : : : "memory");
+    for (;;) {
+        __asm__ __volatile__("pause" : : : "memory");
+    }
+#else
+    (void)hang_enabled;
 #endif
+}
+
+static void ap_handle_ping_request(ap_request_slot_t *slot) {
+    run_ap_request_test_hook(1);
     slot->reply.result_cs = read_cs();
     slot->reply.result_tr = read_tr();
     slot->reply.result_code = 0;
@@ -2012,9 +2033,7 @@ static void ap_handle_ping_request(ap_request_slot_t *slot) {
 }
 
 static void ap_handle_counter_increment(ap_request_slot_t *slot) {
-#if VIBE_AP_REQUEST_FAULT_TEST == VIBE_AP_REQUEST_FAULT_TEST_UD2
-    __asm__ __volatile__("ud2" : : : "memory");
-#endif
+    run_ap_request_test_hook(0);
     ap_counter_value = ap_counter_value + 1U;
     slot->reply.result_cs = read_cs();
     slot->reply.result_tr = read_tr();
