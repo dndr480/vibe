@@ -190,6 +190,7 @@ typedef struct {
 #define AP_REQUEST_SLOT_COUNT 4U
 #define AP_REQUEST_HISTORY_COUNT 8U
 #define AP_REQUEST_NO_SLOT 0xffffffffU
+#define AP_REQUEST_KICK_IPI_VECTOR 0xf0U
 #define AP_REQUEST_IPI_VECTOR 0xf1U
 #define AP_REQUEST_IPI_DRAIN_LOOPS 100000U
 #define LAPIC_SPURIOUS_VECTOR 0xffU
@@ -618,6 +619,7 @@ static cpu_local_t cpu0;
 static cpu_local_t cpu1;
 static cpu_local_t *current_cpu = &cpu0;
 static interrupt_trace_t interrupt_trace;
+static interrupt_trace_t ap_request_kick_ipi_trace;
 static interrupt_trace_t ap_request_ipi_trace;
 static interrupt_trace_t spurious_interrupt_trace;
 static framebuffer_t kernel_framebuffer;
@@ -635,6 +637,8 @@ static volatile UINT32 ap_request_handled_count;
 static volatile UINT32 ap_counter_value;
 static volatile UINT64 ap_lapic_base;
 static volatile UINT32 ap_bsp_apic_id;
+static volatile UINT32 ap_request_kick_ipi_send_count;
+static volatile UINT32 ap_request_kick_ipi_send_fail_count;
 static volatile UINT32 ap_request_ipi_send_count;
 static volatile UINT32 ap_request_ipi_send_fail_count;
 static UINT8 ap_boot_stack[AP_BOOT_STACK_SIZE] __attribute__((aligned(16)));
@@ -651,6 +655,7 @@ extern void isr_fault_df(void);
 extern void isr_fault_gp(void);
 extern void isr_fault_pf(void);
 extern void isr_unhandled(void);
+extern void isr_ap_request_kick_ipi(void);
 extern void isr_ap_request_ipi(void);
 extern void isr_spurious_interrupt(void);
 extern void isr_ap_fault_ud(void);
@@ -710,6 +715,26 @@ __asm__(
     "1:\n"
     "    hlt\n"
     "    jmp 1b\n"
+    ".global isr_ap_request_kick_ipi\n"
+    "isr_ap_request_kick_ipi:\n"
+    "    pushq %rax\n"
+    "    movq 8(%rsp), %rax\n"
+    "    movq %rax, ap_request_kick_ipi_trace+8(%rip)\n"
+    "    movq 16(%rsp), %rax\n"
+    "    movq %rax, ap_request_kick_ipi_trace+16(%rip)\n"
+    "    movq 24(%rsp), %rax\n"
+    "    movq %rax, ap_request_kick_ipi_trace+24(%rip)\n"
+    "    movl $0xf0, ap_request_kick_ipi_trace(%rip)\n"
+    "    movl ap_request_kick_ipi_trace+4(%rip), %eax\n"
+    "    addl $1, %eax\n"
+    "    movl %eax, ap_request_kick_ipi_trace+4(%rip)\n"
+    "    movq ap_lapic_base(%rip), %rax\n"
+    "    testq %rax, %rax\n"
+    "    jz 6f\n"
+    "    movl $0, 0xb0(%rax)\n"
+    "6:\n"
+    "    popq %rax\n"
+    "    iretq\n"
     ".global isr_ap_request_ipi\n"
     "isr_ap_request_ipi:\n"
     "    pushq %rax\n"
@@ -1376,6 +1401,23 @@ static void ap_notify_bsp_request_complete(void) {
     }
 }
 
+static void bsp_notify_ap_request_pending(ap_boot_info_t *boot) {
+    UINT64 base = ap_lapic_base;
+    if (base == 0 || boot->error != AP_BOOT_OK || !boot->online ||
+        boot->ap_state == AP_BOOT_STATE_HALTED ||
+        boot->ap_state == AP_BOOT_STATE_FAULTED) {
+        return;
+    }
+
+    __asm__ __volatile__("mfence" : : : "memory");
+    enable_lapic_if_needed(base);
+    if (lapic_send_ipi(base, boot->target_apic_id, AP_REQUEST_KICK_IPI_VECTOR, boot)) {
+        ap_request_kick_ipi_send_count = ap_request_kick_ipi_send_count + 1U;
+    } else {
+        ap_request_kick_ipi_send_fail_count = ap_request_kick_ipi_send_fail_count + 1U;
+    }
+}
+
 void fault_dispatch(fault_frame_t *frame) {
     framebuffer_t *fb = &kernel_framebuffer;
     char line[192];
@@ -1616,6 +1658,12 @@ static UINT64 isr_ap_request_ipi_addr(void) {
     return addr;
 }
 
+static UINT64 isr_ap_request_kick_ipi_addr(void) {
+    UINT64 addr;
+    __asm__ __volatile__("leaq isr_ap_request_kick_ipi(%%rip), %0" : "=r"(addr));
+    return addr;
+}
+
 static UINT64 isr_spurious_interrupt_addr(void) {
     UINT64 addr;
     __asm__ __volatile__("leaq isr_spurious_interrupt(%%rip), %0" : "=r"(addr));
@@ -1719,6 +1767,7 @@ static void install_idt(void) {
     set_idt_gate(8, isr_fault_df_addr(), cs, CPU_IST_DOUBLE_FAULT, 0x8e);
     set_idt_gate(13, isr_fault_gp_addr(), cs, CPU_IST_FAULT, 0x8e);
     set_idt_gate(14, isr_fault_pf_addr(), cs, CPU_IST_FAULT, 0x8e);
+    set_idt_gate(AP_REQUEST_KICK_IPI_VECTOR, isr_ap_request_kick_ipi_addr(), cs, 0, 0x8e);
     set_idt_gate(AP_REQUEST_IPI_VECTOR, isr_ap_request_ipi_addr(), cs, 0, 0x8e);
     set_idt_gate(LAPIC_SPURIOUS_VECTOR, isr_spurious_interrupt_addr(), cs, 0, 0x8e);
 
@@ -1735,6 +1784,10 @@ static void init_ap_idt(void) {
     set_idt_gate_in(ap_idt, 8, isr_ap_fault_df_addr(), KERNEL_CODE_SELECTOR, CPU_IST_DOUBLE_FAULT, 0x8e);
     set_idt_gate_in(ap_idt, 13, isr_ap_fault_gp_addr(), KERNEL_CODE_SELECTOR, CPU_IST_FAULT, 0x8e);
     set_idt_gate_in(ap_idt, 14, isr_ap_fault_pf_addr(), KERNEL_CODE_SELECTOR, CPU_IST_FAULT, 0x8e);
+    set_idt_gate_in(ap_idt, AP_REQUEST_KICK_IPI_VECTOR, isr_ap_request_kick_ipi_addr(),
+                    KERNEL_CODE_SELECTOR, 0, 0x8e);
+    set_idt_gate_in(ap_idt, LAPIC_SPURIOUS_VECTOR, isr_spurious_interrupt_addr(),
+                    KERNEL_CODE_SELECTOR, 0, 0x8e);
 }
 
 static void run_ap_fault_test_if_enabled(void) {
@@ -1955,6 +2008,7 @@ static void ap_request_loop(void) {
     ap_boot.online = 1;
 
     for (;;) {
+        __asm__ __volatile__("cli" : : : "memory");
         for (UINTN i = 0; i < AP_REQUEST_SLOT_COUNT; i++) {
             ap_request_slot_t *slot = &ap_request_slots[i];
             if (slot->state != AP_REQUEST_STATUS_PENDING) {
@@ -1997,7 +2051,7 @@ static void ap_request_loop(void) {
                 }
             }
         }
-        __asm__ __volatile__("pause" : : : "memory");
+        __asm__ __volatile__("sti; nop; pause; cli" : : : "memory");
     }
 }
 
@@ -2035,6 +2089,8 @@ static void publish_ap_request(ap_request_slot_t *slot, ap_boot_info_t *boot, UI
 
     __asm__ __volatile__("mfence" : : : "memory");
     slot->state = AP_REQUEST_STATUS_PENDING;
+    __asm__ __volatile__("mfence" : : : "memory");
+    bsp_notify_ap_request_pending(boot);
 }
 
 static int ap_request_all_done(ap_request_slot_t *slots, UINTN count) {
@@ -2240,6 +2296,9 @@ static void ap_entry_one(void) {
     load_cpu_tables(&cpu1);
     init_ap_idt();
     load_idt_entries(ap_idt);
+    if (ap_lapic_base != 0) {
+        enable_lapic_if_needed(ap_lapic_base);
+    }
 
     store_gdtr(&gdtr);
     store_idtr(&idtr);
@@ -3145,6 +3204,25 @@ static void draw_ap_queue_summary(framebuffer_t *fb, UINT32 *y, ap_queue_summary
     draw_line(fb, 48, y, line, color, bg, 2);
 }
 
+static void draw_ap_kick_summary(framebuffer_t *fb, UINT32 *y, UINT32 fg, UINT32 accent,
+                                 UINT32 warn, UINT32 bg) {
+    char line[192];
+    char *p = append_str(line, "AP KICK: RX/TX/FAIL: ");
+    p = append_dec(p, ap_request_kick_ipi_trace.count);
+    *p++ = '/';
+    *p = 0;
+    p = append_dec(p, ap_request_kick_ipi_send_count);
+    *p++ = '/';
+    *p = 0;
+    append_dec(p, ap_request_kick_ipi_send_fail_count);
+
+    UINT32 color = ap_request_kick_ipi_send_fail_count ? warn : fg;
+    if (ap_request_kick_ipi_send_count && !ap_request_kick_ipi_send_fail_count) {
+        color = accent;
+    }
+    draw_line(fb, 48, y, line, color, bg, 2);
+}
+
 static void draw_ap_request_history_entry(framebuffer_t *fb, UINT32 *y,
                                           ap_request_history_entry_t *entry,
                                           UINT32 history_number, UINT32 accent,
@@ -3326,6 +3404,7 @@ static void draw_memory_map(framebuffer_t *fb, efi_memory_map_t *map, paging_inf
     if (ap) {
         draw_ap_boot_info(fb, &y, ap, fg, accent, warn, bg);
         draw_ap_queue_summary(fb, &y, &ap_queue_summary, fg, accent, warn, bg);
+        draw_ap_kick_summary(fb, &y, fg, accent, warn, bg);
         if (request_history) {
             draw_ap_request_history(fb, &y, request_history, request_history_count,
                                     fg, accent, warn, bg);
@@ -3631,6 +3710,11 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE image, EFI_SYSTEM_TABLE *st) {
     ap_counter_value = 0;
     ap_lapic_base = acpi.local_apic_base;
     ap_bsp_apic_id = acpi.bsp_apic_id;
+    ap_request_kick_ipi_trace.vector = 0;
+    ap_request_kick_ipi_trace.count = 0;
+    ap_request_kick_ipi_trace.rip = 0;
+    ap_request_kick_ipi_trace.cs = 0;
+    ap_request_kick_ipi_trace.rflags = 0;
     ap_request_ipi_trace.vector = 0;
     ap_request_ipi_trace.count = 0;
     ap_request_ipi_trace.rip = 0;
@@ -3641,6 +3725,8 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE image, EFI_SYSTEM_TABLE *st) {
     spurious_interrupt_trace.rip = 0;
     spurious_interrupt_trace.cs = 0;
     spurious_interrupt_trace.rflags = 0;
+    ap_request_kick_ipi_send_count = 0;
+    ap_request_kick_ipi_send_fail_count = 0;
     ap_request_ipi_send_count = 0;
     ap_request_ipi_send_fail_count = 0;
     bring_up_one_ap(&ap_boot, &acpi, &memory_map, &paging);
