@@ -192,8 +192,11 @@ typedef struct {
 #define AP_REQUEST_NO_SLOT 0xffffffffU
 #define AP_REQUEST_KICK_IPI_VECTOR 0xf0U
 #define AP_REQUEST_IPI_VECTOR 0xf1U
+#define AP_IDLE_TIMER_VECTOR 0xf2U
+#define AP_IDLE_TIMER_INITIAL_COUNT 1000000U
 #define AP_REQUEST_IPI_DRAIN_LOOPS 100000U
 #define LAPIC_SPURIOUS_VECTOR 0xffU
+#define LAPIC_LVT_MASKED (1U << 16)
 
 enum {
     PAGING_OK = 0,
@@ -637,6 +640,9 @@ static volatile UINT32 ap_request_handled_count;
 static volatile UINT32 ap_counter_value;
 static volatile UINT64 ap_lapic_base;
 static volatile UINT32 ap_bsp_apic_id;
+static volatile UINT32 ap_idle_halt_count;
+static volatile UINT32 ap_idle_wake_count;
+static volatile UINT32 ap_idle_timer_count;
 static volatile UINT32 ap_request_kick_ipi_send_count;
 static volatile UINT32 ap_request_kick_ipi_send_fail_count;
 static volatile UINT32 ap_request_ipi_send_count;
@@ -645,6 +651,7 @@ static UINT8 ap_boot_stack[AP_BOOT_STACK_SIZE] __attribute__((aligned(16)));
 
 static int cmpxchg_u32(volatile UINT32 *ptr, UINT32 expected, UINT32 desired);
 static void enable_lapic_if_needed(UINT64 base);
+static void lapic_write32(UINT64 base, UINT32 reg, UINT32 value);
 static int lapic_send_ipi(UINT64 base, UINT32 apic_id, UINT32 command, ap_boot_info_t *boot);
 static void ap_notify_bsp_request_complete(void);
 static UINT64 read_rflags(void);
@@ -657,6 +664,7 @@ extern void isr_fault_pf(void);
 extern void isr_unhandled(void);
 extern void isr_ap_request_kick_ipi(void);
 extern void isr_ap_request_ipi(void);
+extern void isr_ap_idle_timer(void);
 extern void isr_spurious_interrupt(void);
 extern void isr_ap_fault_ud(void);
 extern void isr_ap_fault_df(void);
@@ -753,6 +761,19 @@ __asm__(
     "    jz 5f\n"
     "    movl $0, 0xb0(%rax)\n"
     "5:\n"
+    "    popq %rax\n"
+    "    iretq\n"
+    ".global isr_ap_idle_timer\n"
+    "isr_ap_idle_timer:\n"
+    "    pushq %rax\n"
+    "    movl ap_idle_timer_count(%rip), %eax\n"
+    "    addl $1, %eax\n"
+    "    movl %eax, ap_idle_timer_count(%rip)\n"
+    "    movq ap_lapic_base(%rip), %rax\n"
+    "    testq %rax, %rax\n"
+    "    jz 7f\n"
+    "    movl $0, 0xb0(%rax)\n"
+    "7:\n"
     "    popq %rax\n"
     "    iretq\n"
     ".global isr_spurious_interrupt\n"
@@ -1664,6 +1685,12 @@ static UINT64 isr_ap_request_kick_ipi_addr(void) {
     return addr;
 }
 
+static UINT64 isr_ap_idle_timer_addr(void) {
+    UINT64 addr;
+    __asm__ __volatile__("leaq isr_ap_idle_timer(%%rip), %0" : "=r"(addr));
+    return addr;
+}
+
 static UINT64 isr_spurious_interrupt_addr(void) {
     UINT64 addr;
     __asm__ __volatile__("leaq isr_spurious_interrupt(%%rip), %0" : "=r"(addr));
@@ -1785,6 +1812,8 @@ static void init_ap_idt(void) {
     set_idt_gate_in(ap_idt, 13, isr_ap_fault_gp_addr(), KERNEL_CODE_SELECTOR, CPU_IST_FAULT, 0x8e);
     set_idt_gate_in(ap_idt, 14, isr_ap_fault_pf_addr(), KERNEL_CODE_SELECTOR, CPU_IST_FAULT, 0x8e);
     set_idt_gate_in(ap_idt, AP_REQUEST_KICK_IPI_VECTOR, isr_ap_request_kick_ipi_addr(),
+                    KERNEL_CODE_SELECTOR, 0, 0x8e);
+    set_idt_gate_in(ap_idt, AP_IDLE_TIMER_VECTOR, isr_ap_idle_timer_addr(),
                     KERNEL_CODE_SELECTOR, 0, 0x8e);
     set_idt_gate_in(ap_idt, LAPIC_SPURIOUS_VECTOR, isr_spurious_interrupt_addr(),
                     KERNEL_CODE_SELECTOR, 0, 0x8e);
@@ -2000,6 +2029,28 @@ static UINT32 ap_dispatch_miss_result_code(UINT64 service_id, UINT64 interface_i
     return (UINT32)service_id;
 }
 
+static void ap_disarm_idle_timer(void) {
+    UINT64 base = ap_lapic_base;
+    if (base == 0) {
+        return;
+    }
+
+    lapic_write32(base, 0x380, 0);
+    lapic_write32(base, 0x320, AP_IDLE_TIMER_VECTOR | LAPIC_LVT_MASKED);
+}
+
+static int ap_arm_idle_timer(void) {
+    UINT64 base = ap_lapic_base;
+    if (base == 0) {
+        return 0;
+    }
+
+    lapic_write32(base, 0x3e0, 0x3);
+    lapic_write32(base, 0x320, AP_IDLE_TIMER_VECTOR);
+    lapic_write32(base, 0x380, AP_IDLE_TIMER_INITIAL_COUNT);
+    return 1;
+}
+
 static void ap_request_loop(void) __attribute__((noreturn));
 static void ap_request_loop(void) {
     ap_boot.ap_state = AP_BOOT_STATE_ONLINE;
@@ -2008,6 +2059,7 @@ static void ap_request_loop(void) {
     ap_boot.online = 1;
 
     for (;;) {
+        int handled_work = 0;
         __asm__ __volatile__("cli" : : : "memory");
         for (UINTN i = 0; i < AP_REQUEST_SLOT_COUNT; i++) {
             ap_request_slot_t *slot = &ap_request_slots[i];
@@ -2018,6 +2070,7 @@ static void ap_request_loop(void) {
                              AP_REQUEST_STATUS_RUNNING)) {
                 continue;
             }
+            handled_work = 1;
 
             ap_current_request_slot = (UINT32)i;
             ap_queue_note_slot_start(i);
@@ -2046,12 +2099,23 @@ static void ap_request_loop(void) {
                 ap_current_request_slot = AP_REQUEST_NO_SLOT;
                 complete_ap_request(slot, AP_REQUEST_STATUS_BAD_OP);
                 ap_notify_bsp_request_complete();
+                ap_disarm_idle_timer();
                 for (;;) {
                     __asm__ __volatile__("cli; hlt" : : : "memory");
                 }
             }
         }
-        __asm__ __volatile__("sti; nop; pause; cli" : : : "memory");
+        if (handled_work) {
+            continue;
+        }
+        if (!ap_arm_idle_timer()) {
+            __asm__ __volatile__("sti; nop; pause; cli" : : : "memory");
+            continue;
+        }
+        ap_idle_halt_count = ap_idle_halt_count + 1U;
+        __asm__ __volatile__("sti; hlt; cli" : : : "memory");
+        ap_disarm_idle_timer();
+        ap_idle_wake_count = ap_idle_wake_count + 1U;
     }
 }
 
@@ -2298,6 +2362,7 @@ static void ap_entry_one(void) {
     load_idt_entries(ap_idt);
     if (ap_lapic_base != 0) {
         enable_lapic_if_needed(ap_lapic_base);
+        ap_disarm_idle_timer();
     }
 
     store_gdtr(&gdtr);
@@ -3221,6 +3286,16 @@ static void draw_ap_kick_summary(framebuffer_t *fb, UINT32 *y, UINT32 fg, UINT32
         color = accent;
     }
     draw_line(fb, 48, y, line, color, bg, 2);
+
+    p = append_str(line, "AP IDLE: HALT/WAKE/TIMER: ");
+    p = append_dec(p, ap_idle_halt_count);
+    *p++ = '/';
+    *p = 0;
+    p = append_dec(p, ap_idle_wake_count);
+    *p++ = '/';
+    *p = 0;
+    append_dec(p, ap_idle_timer_count);
+    draw_line(fb, 48, y, line, fg, bg, 2);
 }
 
 static void draw_ap_request_history_entry(framebuffer_t *fb, UINT32 *y,
@@ -3710,6 +3785,9 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE image, EFI_SYSTEM_TABLE *st) {
     ap_counter_value = 0;
     ap_lapic_base = acpi.local_apic_base;
     ap_bsp_apic_id = acpi.bsp_apic_id;
+    ap_idle_halt_count = 0;
+    ap_idle_wake_count = 0;
+    ap_idle_timer_count = 0;
     ap_request_kick_ipi_trace.vector = 0;
     ap_request_kick_ipi_trace.count = 0;
     ap_request_kick_ipi_trace.rip = 0;
