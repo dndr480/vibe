@@ -52,6 +52,9 @@ static void test_miss_result_code(void) {
     check_int(ap_dispatch_miss_result_code(AP_REQUEST_SERVICE_PING, 0x12345678ULL) ==
                   0x12345678U,
               "known service miss returns interface id");
+    check_int(ap_dispatch_miss_result_code(AP_REQUEST_SERVICE_COUNTER, 0x87654321ULL) ==
+                  0x87654321U,
+              "known counter service miss returns interface id");
     check_int(ap_dispatch_miss_result_code(unknown_service, 0x12345678ULL) ==
                   (UINT32)unknown_service,
               "unknown service miss returns service id");
@@ -108,11 +111,79 @@ static void test_counter_handler(void) {
     check_int(slot.reply.result_tr != 0xffffffffffffffffULL, "COUNTER writes TR result");
 }
 
+static void test_handlers_use_explicit_context(void) {
+    volatile UINT32 ping_handled_count_a = 5;
+    volatile UINT32 ping_counter_value_a = 50;
+    volatile UINT32 ping_handled_count_b = 7;
+    volatile UINT32 ping_counter_value_b = 70;
+    volatile UINT32 handled_count_a = 10;
+    volatile UINT32 counter_value_a = 100;
+    volatile UINT32 handled_count_b = 20;
+    volatile UINT32 counter_value_b = 200;
+    ap_service_context_t ping_ctx_a = {&ping_handled_count_a, &ping_counter_value_a};
+    ap_service_context_t ping_ctx_b = {&ping_handled_count_b, &ping_counter_value_b};
+    ap_service_context_t ctx_a = {&handled_count_a, &counter_value_a};
+    ap_service_context_t ctx_b = {&handled_count_b, &counter_value_b};
+    ap_request_slot_t ping_slot_a1;
+    ap_request_slot_t ping_slot_b;
+    ap_request_slot_t ping_slot_a2;
+    ap_request_slot_t slot_a1;
+    ap_request_slot_t slot_b;
+    ap_request_slot_t slot_a2;
+
+    ap_request_handler_t ping_handler = find_ap_request_handler(AP_REQUEST_SERVICE_PING,
+                                                                AP_REQUEST_INTERFACE_PING);
+    ap_request_handler_t counter_handler =
+        find_ap_request_handler(AP_REQUEST_SERVICE_COUNTER,
+                                AP_REQUEST_INTERFACE_COUNTER_INCREMENT);
+    check_int(ping_handler != 0, "PING handler available for context isolation");
+    check_int(counter_handler != 0, "COUNTER handler available for context isolation");
+    if (!ping_handler || !counter_handler) {
+        return;
+    }
+
+    reset_slot(&ping_slot_a1);
+    reset_slot(&ping_slot_b);
+    reset_slot(&ping_slot_a2);
+    reset_slot(&slot_a1);
+    reset_slot(&slot_b);
+    reset_slot(&slot_a2);
+
+    ping_handler(&ping_ctx_a, &ping_slot_a1);
+    ping_handler(&ping_ctx_b, &ping_slot_b);
+    ping_handler(&ping_ctx_a, &ping_slot_a2);
+    counter_handler(&ctx_a, &slot_a1);
+    counter_handler(&ctx_b, &slot_b);
+    counter_handler(&ctx_a, &slot_a2);
+
+    check_int(ping_handled_count_a == 7, "PING context A handled count is independent");
+    check_int(ping_counter_value_a == 50, "PING context A counter is unchanged");
+    check_int(ping_handled_count_b == 8, "PING context B handled count is independent");
+    check_int(ping_counter_value_b == 70, "PING context B counter is unchanged");
+    check_int(ping_slot_a1.metrics.handled_count == 6,
+              "first PING context A metric uses context A");
+    check_int(ping_slot_b.metrics.handled_count == 8, "PING context B metric uses context B");
+    check_int(ping_slot_a2.metrics.handled_count == 7,
+              "second PING context A metric uses context A");
+
+    check_int(handled_count_a == 12, "context A handled count is independent");
+    check_int(counter_value_a == 102, "context A counter is independent");
+    check_int(handled_count_b == 21, "context B handled count is independent");
+    check_int(counter_value_b == 201, "context B counter is independent");
+    check_int(slot_a1.metrics.handled_count == 11, "first context A metric uses context A");
+    check_int(slot_a1.reply.result_code == 101, "first context A result uses context A");
+    check_int(slot_b.metrics.handled_count == 21, "context B metric uses context B");
+    check_int(slot_b.reply.result_code == 201, "context B result uses context B");
+    check_int(slot_a2.metrics.handled_count == 12, "second context A metric uses context A");
+    check_int(slot_a2.reply.result_code == 102, "second context A result uses context A");
+}
+
 int main(void) {
     test_lookup();
     test_miss_result_code();
     test_ping_handler();
     test_counter_handler();
+    test_handlers_use_explicit_context();
 
     if (failures) {
         printf("ap_services: %d failure(s)\n", failures);
