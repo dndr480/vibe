@@ -62,6 +62,10 @@ typedef struct {
 #define VIBE_AP_REQUEST_FAULT_TEST 0
 #endif
 
+#ifndef VIBE_AP_SECOND_REQUEST_OPCODE
+#define VIBE_AP_SECOND_REQUEST_OPCODE AP_REQUEST_OP_PING
+#endif
+
 #define VIBE_AP_REQUEST_FAULT_TEST_NONE 0
 #define VIBE_AP_REQUEST_FAULT_TEST_UD2 1
 
@@ -1551,6 +1555,26 @@ static void ap_handle_ping_request(ap_request_slot_t *slot) {
     slot->metrics.handled_count = slot->metrics.handled_count + 1U;
 }
 
+typedef void (*ap_request_handler_t)(ap_request_slot_t *slot);
+
+typedef struct {
+    UINT32 opcode;
+    ap_request_handler_t handler;
+} ap_request_dispatch_entry_t;
+
+static const ap_request_dispatch_entry_t ap_request_dispatch_table[] = {
+    {AP_REQUEST_OP_PING, ap_handle_ping_request},
+};
+
+static ap_request_handler_t find_ap_request_handler(UINT32 opcode) {
+    for (UINTN i = 0; i < sizeof(ap_request_dispatch_table) / sizeof(ap_request_dispatch_table[0]); i++) {
+        if (ap_request_dispatch_table[i].opcode == opcode) {
+            return ap_request_dispatch_table[i].handler;
+        }
+    }
+    return 0;
+}
+
 static void ap_request_loop(void) __attribute__((noreturn));
 static void ap_request_loop(void) {
     ap_boot.ap_state = AP_BOOT_STATE_ONLINE;
@@ -1569,8 +1593,9 @@ static void ap_request_loop(void) {
             ap_boot.entry_state = AP_ENTRY_STATE_REQUEST;
             __asm__ __volatile__("mfence" : : : "memory");
 
-            if (ap_request.request.opcode == AP_REQUEST_OP_PING) {
-                ap_handle_ping_request(&ap_request);
+            ap_request_handler_t handler = find_ap_request_handler(ap_request.request.opcode);
+            if (handler) {
+                handler(&ap_request);
                 ap_boot.ap_state = AP_BOOT_STATE_ONLINE;
                 ap_boot.entry_state = AP_ENTRY_STATE_LOOP;
                 complete_ap_request(AP_REQUEST_STATUS_DONE);
@@ -1589,18 +1614,19 @@ static void ap_request_loop(void) {
     }
 }
 
-static void prepare_ap_ping_request(ap_request_slot_t *slot, UINT32 sequence, UINT32 handled_count) {
+static void prepare_ap_request(ap_request_slot_t *slot, UINT32 opcode, UINT32 sequence,
+                               UINT32 handled_count) {
     slot->metrics.handled_count = handled_count;
     slot->request.source_cpu = 0;
     slot->request.target_cpu = 1;
-    slot->request.opcode = AP_REQUEST_OP_PING;
+    slot->request.opcode = opcode;
     slot->request.sequence = sequence;
     slot->request.id_high = 0x41502d50494e4721ULL;
     slot->request.id_low = sequence;
 }
 
-static void send_ap_ping_request(ap_request_slot_t *slot, ap_boot_info_t *boot, UINT32 sequence,
-                                 UINT32 keep_handled_count) {
+static void send_ap_request(ap_request_slot_t *slot, ap_boot_info_t *boot, UINT32 opcode,
+                            UINT32 sequence, UINT32 keep_handled_count) {
     UINT32 handled_count = keep_handled_count ? slot->metrics.handled_count : 0;
 
     reset_ap_request_slot(slot);
@@ -1615,7 +1641,7 @@ static void send_ap_ping_request(ap_request_slot_t *slot, ap_boot_info_t *boot, 
         return;
     }
 
-    prepare_ap_ping_request(slot, sequence, handled_count);
+    prepare_ap_request(slot, opcode, sequence, handled_count);
     if (boot->ap_state == AP_BOOT_STATE_HALTED) {
         slot->state = AP_REQUEST_STATUS_SKIPPED;
         return;
@@ -2952,9 +2978,9 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE image, EFI_SYSTEM_TABLE *st) {
     parse_acpi(acpi_rsdp, &memory_map, &acpi);
     reset_ap_request_slot(&ap_request);
     bring_up_one_ap(&ap_boot, &acpi, &memory_map, &paging);
-    send_ap_ping_request(&ap_request, &ap_boot, 1, 0);
+    send_ap_request(&ap_request, &ap_boot, AP_REQUEST_OP_PING, 1, 0);
     if (ap_request.state == AP_REQUEST_STATUS_DONE && ap_boot.ap_state != AP_BOOT_STATE_FAULTED) {
-        send_ap_ping_request(&ap_request, &ap_boot, 2, 1);
+        send_ap_request(&ap_request, &ap_boot, VIBE_AP_SECOND_REQUEST_OPCODE, 2, 1);
     }
 
     clear_screen(&fb, bg);
