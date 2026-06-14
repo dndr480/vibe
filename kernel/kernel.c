@@ -607,6 +607,9 @@ typedef struct {
     ap_request_slot_t request_slots[AP_REQUEST_SLOT_COUNT];
     ap_request_history_entry_t request_history[AP_REQUEST_HISTORY_COUNT];
     ap_queue_summary_t queue_summary;
+    volatile UINT32 current_request_slot;
+    volatile UINT32 request_handled_count;
+    volatile UINT32 counter_value;
 } ap_context_t;
 
 typedef struct {
@@ -647,9 +650,6 @@ static UINT32 kernel_warn;
 static uuid128_t current_request_uuid;
 static ap_boot_info_t ap_boot;
 static ap_context_t ap_contexts[1];
-static volatile UINT32 ap_current_request_slot;
-static volatile UINT32 ap_request_handled_count;
-static volatile UINT32 ap_counter_value;
 static volatile UINT64 ap_lapic_base;
 static volatile UINT32 ap_bsp_apic_id;
 static volatile UINT32 ap_idle_halt_count;
@@ -1544,7 +1544,7 @@ void ap_fault_dispatch(fault_frame_t *frame) {
     __asm__ __volatile__("cli" : : : "memory");
 
     ap_context_t *ctx = ap0_context();
-    UINT32 slot_index = ap_current_request_slot;
+    UINT32 slot_index = ctx->current_request_slot;
     ap_request_slot_t *slot = slot_index < AP_REQUEST_SLOT_COUNT ?
                               &ctx->request_slots[slot_index] : 0;
     UINT32 request_state = slot ? slot->state : AP_REQUEST_STATUS_EMPTY;
@@ -2032,28 +2032,28 @@ static void run_ap_request_test_hook(int hang_enabled) {
 #endif
 }
 
-static void ap_handle_ping_request(ap_request_slot_t *slot) {
+static void ap_handle_ping_request(ap_context_t *ctx, ap_request_slot_t *slot) {
     run_ap_request_test_hook(1);
     slot->reply.result_cs = read_cs();
     slot->reply.result_tr = read_tr();
     slot->reply.result_code = 0;
     slot->reply.fault_code = 0;
-    ap_request_handled_count = ap_request_handled_count + 1U;
-    slot->metrics.handled_count = ap_request_handled_count;
+    ctx->request_handled_count = ctx->request_handled_count + 1U;
+    slot->metrics.handled_count = ctx->request_handled_count;
 }
 
-static void ap_handle_counter_increment(ap_request_slot_t *slot) {
+static void ap_handle_counter_increment(ap_context_t *ctx, ap_request_slot_t *slot) {
     run_ap_request_test_hook(0);
-    ap_counter_value = ap_counter_value + 1U;
+    ctx->counter_value = ctx->counter_value + 1U;
     slot->reply.result_cs = read_cs();
     slot->reply.result_tr = read_tr();
-    slot->reply.result_code = ap_counter_value;
+    slot->reply.result_code = ctx->counter_value;
     slot->reply.fault_code = 0;
-    ap_request_handled_count = ap_request_handled_count + 1U;
-    slot->metrics.handled_count = ap_request_handled_count;
+    ctx->request_handled_count = ctx->request_handled_count + 1U;
+    slot->metrics.handled_count = ctx->request_handled_count;
 }
 
-typedef void (*ap_request_handler_t)(ap_request_slot_t *slot);
+typedef void (*ap_request_handler_t)(ap_context_t *ctx, ap_request_slot_t *slot);
 
 typedef struct {
     UINT64 service_id;
@@ -2171,9 +2171,9 @@ static void ap_request_loop(void) {
             }
             handled_work = 1;
 
-            ap_current_request_slot = (UINT32)i;
+            ctx->current_request_slot = (UINT32)i;
             ap_queue_note_slot_start(ctx, i);
-            slot->metrics.handled_count = ap_request_handled_count;
+            slot->metrics.handled_count = ctx->request_handled_count;
             begin_ap_reply(slot);
             ap_boot.entry_state = AP_ENTRY_STATE_REQUEST;
             __asm__ __volatile__("mfence" : : : "memory");
@@ -2181,11 +2181,11 @@ static void ap_request_loop(void) {
             ap_request_handler_t handler = find_ap_request_handler(slot->request.service_id,
                                                                    slot->request.interface_id);
             if (handler) {
-                handler(slot);
+                handler(ctx, slot);
                 ap_boot.ap_state = AP_BOOT_STATE_ONLINE;
                 ap_boot.entry_state = AP_ENTRY_STATE_LOOP;
                 ap_queue_note_slot_terminal(ctx, i, AP_REQUEST_STATUS_DONE, AP_QUEUE_STOP_NONE);
-                ap_current_request_slot = AP_REQUEST_NO_SLOT;
+                ctx->current_request_slot = AP_REQUEST_NO_SLOT;
                 complete_ap_request(slot, AP_REQUEST_STATUS_DONE);
                 ap_notify_bsp_request_complete();
             } else {
@@ -2195,7 +2195,7 @@ static void ap_request_loop(void) {
                 ap_boot.ap_state = AP_BOOT_STATE_HALTED;
                 ap_boot.entry_state = AP_ENTRY_STATE_HALTED;
                 ap_queue_note_slot_terminal(ctx, i, AP_REQUEST_STATUS_BAD_OP, AP_QUEUE_STOP_BAD_OP);
-                ap_current_request_slot = AP_REQUEST_NO_SLOT;
+                ctx->current_request_slot = AP_REQUEST_NO_SLOT;
                 complete_ap_request(slot, AP_REQUEST_STATUS_BAD_OP);
                 ap_notify_bsp_request_complete();
                 ap_disarm_idle_timer();
@@ -2397,7 +2397,7 @@ static int run_ap_request_stream(ap_context_t *ctx, ap_boot_info_t *boot, const 
     UINTN count = ap_request_slot_limit(AP_REQUEST_SLOT_COUNT);
     UINTN next_plan = 0;
     UINTN completed_count = 0;
-    UINT32 counter_base = ap_counter_value;
+    UINT32 counter_base = ctx->counter_value;
     UINT64 rflags = read_rflags();
     int stopped = 0;
 
@@ -3928,9 +3928,9 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE image, EFI_SYSTEM_TABLE *st) {
     }
     reset_ap_request_history(ap0);
     reset_ap_queue_summary(ap0);
-    ap_current_request_slot = AP_REQUEST_NO_SLOT;
-    ap_request_handled_count = 0;
-    ap_counter_value = 0;
+    ap0->current_request_slot = AP_REQUEST_NO_SLOT;
+    ap0->request_handled_count = 0;
+    ap0->counter_value = 0;
     ap_lapic_base = acpi.local_apic_base;
     ap_bsp_apic_id = acpi.bsp_apic_id;
     ap_idle_halt_count = 0;
