@@ -167,6 +167,7 @@ typedef struct {
 #define ACPI_MAX_RSDP_LENGTH 4096U
 #define ACPI_MAX_SDT_LENGTH (1024U * 1024U)
 #define ACPI_CPU_LIST_OUTPUT_LIMIT 5
+#define MAX_AP_CONTEXTS 8
 #define AP_BOOT_STACK_SIZE (16 * 1024)
 #define AP_TRAMPOLINE_PAGES 1ULL
 #define AP_TRAMPOLINE_MAX_ADDRESS 0x9F000ULL
@@ -635,7 +636,7 @@ static bsp_context_t bsp_context;
 static bsp_interrupt_observe_t bsp_interrupt_observe;
 static system_interrupt_observe_t system_interrupt_observe;
 static bsp_fault_display_t bsp_fault_display;
-static ap_context_t ap_contexts[1];
+static ap_context_t ap_contexts[MAX_AP_CONTEXTS];
 static ap_interrupt_observe_t *ap0_interrupts __attribute__((used)) = &ap_contexts[0].interrupts;
 static volatile UINT64 system_lapic_base;
 static bsp_wait_observe_t bsp_wait_observe;
