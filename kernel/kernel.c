@@ -188,7 +188,7 @@ typedef struct {
 #define AP_ONLINE_TIMEOUT_LOOPS 100000000U
 #define AP_REQUEST_TIMEOUT_LOOPS 100000000U
 #define AP_REQUEST_SLOT_COUNT 4U
-#define AP_REQUEST_SNAPSHOT_COUNT 4U
+#define AP_REQUEST_HISTORY_COUNT 8U
 #define AP_REQUEST_NO_SLOT 0xffffffffU
 #define AP_REQUEST_IPI_VECTOR 0xf1U
 #define AP_REQUEST_IPI_DRAIN_LOOPS 100000U
@@ -578,8 +578,9 @@ typedef struct {
 typedef struct {
     ap_request_slot_t request;
     UINT32 counter_value;
+    UINT32 slot;
     UINT32 valid;
-} ap_request_snapshot_t;
+} ap_request_history_entry_t;
 
 typedef struct {
     volatile UINT32 current_slot;
@@ -627,7 +628,7 @@ static UINT32 kernel_warn;
 static uuid128_t current_request_uuid;
 static ap_boot_info_t ap_boot;
 static ap_request_slot_t ap_request_slots[AP_REQUEST_SLOT_COUNT];
-static ap_request_snapshot_t ap_request_snapshots[AP_REQUEST_SNAPSHOT_COUNT];
+static ap_request_history_entry_t ap_request_history[AP_REQUEST_HISTORY_COUNT];
 static ap_queue_summary_t ap_queue_summary;
 static volatile UINT32 ap_current_request_slot;
 static volatile UINT32 ap_request_handled_count;
@@ -873,6 +874,16 @@ static char *append_hex64(char *p, UINT64 value) {
     static const char digits[] = "0123456789ABCDEF";
     p = append_str(p, "0X");
     for (int shift = 60; shift >= 0; shift -= 4) {
+        *p++ = digits[(value >> shift) & 0xf];
+    }
+    *p = 0;
+    return p;
+}
+
+static char *append_hex32(char *p, UINT32 value) {
+    static const char digits[] = "0123456789ABCDEF";
+    p = append_str(p, "0X");
+    for (int shift = 28; shift >= 0; shift -= 4) {
         *p++ = digits[(value >> shift) & 0xf];
     }
     *p = 0;
@@ -1776,11 +1787,12 @@ static void copy_ap_request_slot(ap_request_slot_t *dst, ap_request_slot_t *src)
     dst->metrics.wait_loops = src->metrics.wait_loops;
 }
 
-static void reset_ap_request_snapshots(void) {
-    for (UINTN i = 0; i < AP_REQUEST_SNAPSHOT_COUNT; i++) {
-        reset_ap_request_slot(&ap_request_snapshots[i].request);
-        ap_request_snapshots[i].counter_value = 0;
-        ap_request_snapshots[i].valid = 0;
+static void reset_ap_request_history(void) {
+    for (UINTN i = 0; i < AP_REQUEST_HISTORY_COUNT; i++) {
+        reset_ap_request_slot(&ap_request_history[i].request);
+        ap_request_history[i].counter_value = 0;
+        ap_request_history[i].slot = 0;
+        ap_request_history[i].valid = 0;
     }
 }
 
@@ -1790,15 +1802,17 @@ static int ap_request_is_counter_increment(ap_request_slot_t *slot) {
            slot->request.opcode == AP_REQUEST_OP_COUNTER;
 }
 
-static void snapshot_ap_request(UINTN index, ap_request_slot_t *slot, UINT32 counter_value) {
-    if (index >= AP_REQUEST_SNAPSHOT_COUNT) {
+static void record_ap_request_history(UINTN index, UINTN slot_index, ap_request_slot_t *slot,
+                                      UINT32 counter_value) {
+    if (index >= AP_REQUEST_HISTORY_COUNT) {
         return;
     }
 
     __asm__ __volatile__("mfence" : : : "memory");
-    copy_ap_request_slot(&ap_request_snapshots[index].request, slot);
-    ap_request_snapshots[index].counter_value = counter_value;
-    ap_request_snapshots[index].valid = 1;
+    copy_ap_request_slot(&ap_request_history[index].request, slot);
+    ap_request_history[index].counter_value = counter_value;
+    ap_request_history[index].slot = (UINT32)(slot_index + 1U);
+    ap_request_history[index].valid = 1;
     __asm__ __volatile__("mfence" : : : "memory");
 }
 
@@ -2048,14 +2062,14 @@ static UINTN ap_request_slot_limit(UINTN count) {
     return count;
 }
 
-static void snapshot_ap_stream_slot(UINTN slot_index, ap_request_slot_t *slot,
-                                    UINT32 *counter_value) {
+static void record_ap_stream_slot(UINTN history_index, UINTN slot_index,
+                                  ap_request_slot_t *slot, UINT32 *counter_value) {
     if (ap_request_is_counter_increment(slot) &&
         slot->state == AP_REQUEST_STATUS_DONE &&
         slot->reply.fault_code == 0) {
         *counter_value = *counter_value + 1U;
     }
-    snapshot_ap_request(slot_index, slot, *counter_value);
+    record_ap_request_history(history_index, slot_index, slot, *counter_value);
 }
 
 static void publish_ap_stream_slot(ap_request_slot_t *slots, UINT8 *active,
@@ -2114,7 +2128,7 @@ static int finish_ap_stream_slot(ap_request_slot_t *slots, UINT8 *active, UINTN 
     }
 
     slot->metrics.wait_loops = wait_loops;
-    snapshot_ap_stream_slot(slot_index, slot, counter_value);
+    record_ap_stream_slot(*completed_count, slot_index, slot, counter_value);
     active[slot_index] = 0;
     *completed_count = *completed_count + 1U;
     return state == AP_REQUEST_STATUS_DONE;
@@ -2156,7 +2170,7 @@ static int run_ap_request_stream(ap_request_slot_t *slots, UINTN slot_count,
     }
 
     reset_ap_queue_summary();
-    reset_ap_request_snapshots();
+    reset_ap_request_history();
     ap_queue_summary.planned_count = (UINT32)plan_count;
     for (UINTN i = 0; i < AP_REQUEST_SLOT_COUNT; i++) {
         active[i] = 0;
@@ -3131,20 +3145,24 @@ static void draw_ap_queue_summary(framebuffer_t *fb, UINT32 *y, ap_queue_summary
     draw_line(fb, 48, y, line, color, bg, 2);
 }
 
-static void draw_ap_request_info(framebuffer_t *fb, UINT32 *y, ap_request_slot_t *request,
-                                 UINT32 request_number, UINT32 counter_value, UINT32 fg,
-                                 UINT32 accent, UINT32 warn, UINT32 bg) {
-    char line[192];
+static void draw_ap_request_history_entry(framebuffer_t *fb, UINT32 *y,
+                                          ap_request_history_entry_t *entry,
+                                          UINT32 history_number, UINT32 accent,
+                                          UINT32 warn, UINT32 bg) {
+    ap_request_slot_t *request = &entry->request;
+    char line[256];
     char *p;
-    int ok = ap_request_result_ok(request, counter_value);
-    int has_reply_id = request->reply.request_id_high != 0 || request->reply.request_id_low != 0;
-    int has_terminal_reply = has_reply_id &&
-                             (request->state == AP_REQUEST_STATUS_DONE ||
-                              request->state == AP_REQUEST_STATUS_BAD_OP ||
-                              request->state == AP_REQUEST_STATUS_FAULT);
+    int ok = ap_request_result_ok(request, entry->counter_value);
+    UINT32 color = ok ? accent : warn;
+    if (request->state == AP_REQUEST_STATUS_SKIPPED ||
+        request->state == AP_REQUEST_STATUS_TIMEOUT) {
+        color = warn;
+    }
 
-    p = append_str(line, "AP REQUEST ");
-    p = append_dec(p, request_number);
+    p = append_str(line, "AP HIST ");
+    p = append_dec(p, history_number);
+    p = append_str(p, " SLOT ");
+    p = append_dec(p, entry->slot);
     p = append_str(p, ": ");
     p = append_str(p, ap_request_op_name(request->request.opcode));
     p = append_str(p, ok ? " OK" : " NOT-OK");
@@ -3152,63 +3170,41 @@ static void draw_ap_request_info(framebuffer_t *fb, UINT32 *y, ap_request_slot_t
     p = append_str(p, ap_request_state_name(request->state));
     p = append_str(p, "  SEQ: ");
     p = append_dec(p, request->request.sequence);
-    p = append_str(p, "  CPU: ");
-    p = append_dec(p, request->request.source_cpu);
-    *p++ = '/';
-    *p = 0;
-    p = append_dec(p, request->request.target_cpu);
     p = append_str(p, "  WAIT: ");
     p = append_dec(p, request->metrics.wait_loops);
     p = append_str(p, "  COUNT: ");
-    append_dec(p, request->metrics.handled_count);
-    draw_line(fb, 48, y, line, ok ? accent : warn, bg, 2);
-
-    p = append_str(line, "AP KEY: SVC: ");
-    p = append_hex64(p, request->request.service_id);
-    p = append_str(p, "  IFACE: ");
-    append_hex64(p, request->request.interface_id);
-    draw_line(fb, 48, y, line, ok ? fg : warn, bg, 2);
-
-    if (has_terminal_reply) {
-        p = append_str(line, "AP REPLY ID: ");
-        p = append_hex64(p, request->reply.request_id_high);
-        *p++ = '-';
-        *p = 0;
-        p = append_hex64(p, request->reply.request_id_low);
-        p = append_str(p, "  RESULT: ");
-        p = append_dec(p, request->reply.result_code);
-        p = append_str(p, "  FAULT: ");
-        p = append_dec(p, request->reply.fault_code);
-        p = append_str(p, "  CS: ");
-        p = append_hex64(p, request->reply.result_cs);
-        p = append_str(p, "  TR: ");
-        append_hex64(p, request->reply.result_tr);
-    } else {
-        p = append_str(line, "AP REPLY: ");
-        p = append_str(p, ap_request_state_name(request->state));
-        p = append_str(p, "  RESULT: -  FAULT: ");
-        append_dec(p, request->reply.fault_code);
-    }
-    draw_line(fb, 48, y, line, ok ? fg : warn, bg, 2);
+    p = append_dec(p, request->metrics.handled_count);
+    p = append_str(p, "  RESULT: ");
+    p = append_dec(p, request->reply.result_code);
+    p = append_str(p, "  FAULT: ");
+    p = append_dec(p, request->reply.fault_code);
+    p = append_str(p, "  S/I: ");
+    p = append_hex32(p, (UINT32)request->request.service_id);
+    *p++ = '/';
+    *p = 0;
+    append_hex32(p, (UINT32)request->request.interface_id);
+    draw_line(fb, 48, y, line, color, bg, 2);
 }
 
-static void draw_ap_request_snapshots(framebuffer_t *fb, UINT32 *y,
-                                      ap_request_snapshot_t *snapshots, UINTN count,
-                                      UINT32 fg, UINT32 accent, UINT32 warn, UINT32 bg) {
+static void draw_ap_request_history(framebuffer_t *fb, UINT32 *y,
+                                    ap_request_history_entry_t *history, UINTN count,
+                                    UINT32 fg, UINT32 accent, UINT32 warn, UINT32 bg) {
     UINT32 drawn = 0;
 
     for (UINTN i = 0; i < count; i++) {
-        if (!snapshots[i].valid) {
+        if (!history[i].valid) {
             continue;
         }
-        draw_ap_request_info(fb, y, &snapshots[i].request, (UINT32)(i + 1),
-                             snapshots[i].counter_value, fg, accent, warn, bg);
+        draw_ap_request_history_entry(fb, y, &history[i], (UINT32)(i + 1),
+                                      accent, warn, bg);
         drawn++;
     }
 
     if (!drawn) {
-        draw_line(fb, 48, y, "AP REQUESTS: NONE", warn, bg, 2);
+        draw_line(fb, 48, y, "AP HISTORY: NONE", warn, bg, 2);
     }
+
+    (void)fg;
 }
 
 static int draw_map_line(framebuffer_t *fb, UINT32 *y, const char *s, UINT32 fg, UINT32 bg) {
@@ -3236,7 +3232,7 @@ static UINT32 memory_line_color(EFI_MEMORY_DESCRIPTOR *desc, UINT32 fg, UINT32 m
 
 static void draw_memory_map(framebuffer_t *fb, efi_memory_map_t *map, paging_info_t *paging,
                             acpi_info_t *acpi, ap_boot_info_t *ap,
-                            ap_request_snapshot_t *request_snapshots, UINTN request_snapshot_count,
+                            ap_request_history_entry_t *request_history, UINTN request_history_count,
                             UINT32 fg, UINT32 muted, UINT32 accent, UINT32 warn, UINT32 bg) {
     UINT64 conventional_pages = 0;
     UINT64 loader_pages = 0;
@@ -3330,9 +3326,9 @@ static void draw_memory_map(framebuffer_t *fb, efi_memory_map_t *map, paging_inf
     if (ap) {
         draw_ap_boot_info(fb, &y, ap, fg, accent, warn, bg);
         draw_ap_queue_summary(fb, &y, &ap_queue_summary, fg, accent, warn, bg);
-        if (request_snapshots) {
-            draw_ap_request_snapshots(fb, &y, request_snapshots, request_snapshot_count,
-                                      fg, accent, warn, bg);
+        if (request_history) {
+            draw_ap_request_history(fb, &y, request_history, request_history_count,
+                                    fg, accent, warn, bg);
         }
         y += 8;
     }
@@ -3628,7 +3624,7 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE image, EFI_SYSTEM_TABLE *st) {
     for (UINTN i = 0; i < AP_REQUEST_SLOT_COUNT; i++) {
         reset_ap_request_slot(&ap_request_slots[i]);
     }
-    reset_ap_request_snapshots();
+    reset_ap_request_history();
     reset_ap_queue_summary();
     ap_current_request_slot = AP_REQUEST_NO_SLOT;
     ap_request_handled_count = 0;
@@ -3672,7 +3668,7 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE image, EFI_SYSTEM_TABLE *st) {
 
     clear_screen(&fb, bg);
     draw_memory_map(&fb, &memory_map, &paging, &acpi, &ap_boot,
-                    ap_request_snapshots, AP_REQUEST_SNAPSHOT_COUNT,
+                    ap_request_history, AP_REQUEST_HISTORY_COUNT,
                     fg, muted, accent, warn, bg);
     run_fault_test_if_enabled();
 
