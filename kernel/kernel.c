@@ -606,6 +606,8 @@ typedef struct {
 typedef struct {
     ap_boot_info_t boot;
     UINT8 boot_stack[AP_BOOT_STACK_SIZE] __attribute__((aligned(16)));
+    cpu_local_t cpu;
+    idt_entry_t idt[256];
     ap_request_slot_t request_slots[AP_REQUEST_SLOT_COUNT];
     ap_request_history_entry_t request_history[AP_REQUEST_HISTORY_COUNT];
     ap_queue_summary_t queue_summary;
@@ -642,9 +644,7 @@ typedef struct {
 } uuid128_t;
 
 static idt_entry_t idt[256];
-static idt_entry_t ap_idt[256];
 static cpu_local_t cpu0;
-static cpu_local_t cpu1;
 static cpu_local_t *current_cpu = &cpu0;
 static interrupt_trace_t interrupt_trace;
 static interrupt_trace_t ap_request_kick_ipi_trace;
@@ -1845,21 +1845,22 @@ static void install_idt(void) {
     load_idt_table();
 }
 
-static void init_ap_idt(void) {
+static void init_ap_idt(ap_context_t *ctx) {
+    idt_entry_t *table = ctx->idt;
     UINT64 unhandled_addr = isr_ap_unhandled_addr();
 
     for (UINT32 vector = 0; vector < 256; vector++) {
-        set_idt_gate_in(ap_idt, vector, unhandled_addr, KERNEL_CODE_SELECTOR, 0, 0x8e);
+        set_idt_gate_in(table, vector, unhandled_addr, KERNEL_CODE_SELECTOR, 0, 0x8e);
     }
-    set_idt_gate_in(ap_idt, 6, isr_ap_fault_ud_addr(), KERNEL_CODE_SELECTOR, CPU_IST_FAULT, 0x8e);
-    set_idt_gate_in(ap_idt, 8, isr_ap_fault_df_addr(), KERNEL_CODE_SELECTOR, CPU_IST_DOUBLE_FAULT, 0x8e);
-    set_idt_gate_in(ap_idt, 13, isr_ap_fault_gp_addr(), KERNEL_CODE_SELECTOR, CPU_IST_FAULT, 0x8e);
-    set_idt_gate_in(ap_idt, 14, isr_ap_fault_pf_addr(), KERNEL_CODE_SELECTOR, CPU_IST_FAULT, 0x8e);
-    set_idt_gate_in(ap_idt, AP_REQUEST_KICK_IPI_VECTOR, isr_ap_request_kick_ipi_addr(),
+    set_idt_gate_in(table, 6, isr_ap_fault_ud_addr(), KERNEL_CODE_SELECTOR, CPU_IST_FAULT, 0x8e);
+    set_idt_gate_in(table, 8, isr_ap_fault_df_addr(), KERNEL_CODE_SELECTOR, CPU_IST_DOUBLE_FAULT, 0x8e);
+    set_idt_gate_in(table, 13, isr_ap_fault_gp_addr(), KERNEL_CODE_SELECTOR, CPU_IST_FAULT, 0x8e);
+    set_idt_gate_in(table, 14, isr_ap_fault_pf_addr(), KERNEL_CODE_SELECTOR, CPU_IST_FAULT, 0x8e);
+    set_idt_gate_in(table, AP_REQUEST_KICK_IPI_VECTOR, isr_ap_request_kick_ipi_addr(),
                     KERNEL_CODE_SELECTOR, 0, 0x8e);
-    set_idt_gate_in(ap_idt, AP_IDLE_TIMER_VECTOR, isr_ap_idle_timer_addr(),
+    set_idt_gate_in(table, AP_IDLE_TIMER_VECTOR, isr_ap_idle_timer_addr(),
                     KERNEL_CODE_SELECTOR, 0, 0x8e);
-    set_idt_gate_in(ap_idt, LAPIC_SPURIOUS_VECTOR, isr_spurious_interrupt_addr(),
+    set_idt_gate_in(table, LAPIC_SPURIOUS_VECTOR, isr_spurious_interrupt_addr(),
                     KERNEL_CODE_SELECTOR, 0, 0x8e);
 }
 
@@ -2496,14 +2497,15 @@ static void ap_entry_one(void) {
     descriptor_table_ptr_t idtr;
     ap_context_t *ctx = ap0_context();
     ap_boot_info_t *boot = &ctx->boot;
+    cpu_local_t *cpu = &ctx->cpu;
 
     __asm__ __volatile__("cli" : : : "memory");
     boot->entry_state = AP_ENTRY_STATE_C;
 
-    init_cpu_local(&cpu1, 1);
-    load_cpu_tables(&cpu1);
-    init_ap_idt();
-    load_idt_entries(ap_idt);
+    init_cpu_local(cpu, 1);
+    load_cpu_tables(cpu);
+    init_ap_idt(ctx);
+    load_idt_entries(ctx->idt);
     if (ap_lapic_base != 0) {
         enable_lapic_if_needed(ap_lapic_base);
         ap_disarm_idle_timer();
@@ -2514,14 +2516,14 @@ static void ap_entry_one(void) {
 
     boot->ap_cs = read_cs();
     boot->ap_tr = read_tr();
-    boot->ap_ist1 = cpu1.tss.ist[CPU_IST_FAULT - 1];
-    boot->ap_ist2 = cpu1.tss.ist[CPU_IST_DOUBLE_FAULT - 1];
-    boot->gdt_ok = (gdtr.base == (UINT64)(UINTN)cpu1.gdt &&
-                    gdtr.limit == (UINT16)(sizeof(cpu1.gdt) - 1)) ? 1U : 0U;
-    boot->tss_ok = (boot->ap_tr == KERNEL_TSS_SELECTOR && cpu1.tss_ready &&
+    boot->ap_ist1 = cpu->tss.ist[CPU_IST_FAULT - 1];
+    boot->ap_ist2 = cpu->tss.ist[CPU_IST_DOUBLE_FAULT - 1];
+    boot->gdt_ok = (gdtr.base == (UINT64)(UINTN)cpu->gdt &&
+                    gdtr.limit == (UINT16)(sizeof(cpu->gdt) - 1)) ? 1U : 0U;
+    boot->tss_ok = (boot->ap_tr == KERNEL_TSS_SELECTOR && cpu->tss_ready &&
                     boot->ap_ist1 != 0 && boot->ap_ist2 != 0) ? 1U : 0U;
-    boot->idt_ok = (idtr.base == (UINT64)(UINTN)ap_idt &&
-                    idtr.limit == (UINT16)(sizeof(ap_idt) - 1)) ? 1U : 0U;
+    boot->idt_ok = (idtr.base == (UINT64)(UINTN)ctx->idt &&
+                    idtr.limit == (UINT16)(sizeof(ctx->idt) - 1)) ? 1U : 0U;
     boot->entry_state = AP_ENTRY_STATE_TABLES;
     run_ap_fault_test_if_enabled();
     ap_request_loop();
