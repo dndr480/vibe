@@ -2315,14 +2315,12 @@ static void ap_request_loop(ap_context_t *ctx) {
     }
 }
 
-static void publish_ap_inbox_request(ap_context_t *ctx, UINTN slot_index, UINT32 opcode,
-                                     UINT64 service_id, UINT64 interface_id, UINT32 sequence,
-                                     int send_kick) {
+static void publish_ap_inbox_request(ap_context_t *ctx, UINTN slot_index,
+                                     const ap_request_plan_t *plan, int send_kick) {
     ap_boot_info_t *boot = &ctx->boot;
     ap_request_slot_t *slot = ap_inbox_slot(ctx, slot_index);
     reset_ap_inbox_slot(ctx, slot_index);
-    prepare_ap_request_slot(slot, ap_context_index(ctx) + 1U, opcode, service_id,
-                            interface_id, sequence);
+    prepare_ap_request_slot_from_plan(slot, ap_context_index(ctx) + 1U, plan);
     if (boot->ap_state == AP_BOOT_STATE_FAULTED) {
         slot->reply.fault_code = (UINT32)boot->fault_vector;
         slot->state = AP_REQUEST_STATUS_FAULT;
@@ -2376,8 +2374,7 @@ static void record_ap_stream_slot(ap_context_t *ctx, UINTN history_index, UINTN 
 
 static void publish_ap_stream_slot(ap_context_t *ctx, UINT8 *active, UINTN slot_index,
                                    const ap_request_plan_t *plan) {
-    publish_ap_inbox_request(ctx, slot_index, plan->opcode, plan->service_id,
-                             plan->interface_id, plan->sequence, 1);
+    publish_ap_inbox_request(ctx, slot_index, plan, 1);
     active[slot_index] = 1;
 }
 
@@ -2662,9 +2659,13 @@ static void run_ap_broadcast_ping(ap_context_t *contexts, UINTN context_count,
             continue;
         }
 
-        publish_ap_inbox_request(ctx, AP_BROADCAST_PING_SLOT_INDEX, AP_REQUEST_OP_PING,
-                                 AP_REQUEST_SERVICE_PING, AP_REQUEST_INTERFACE_PING,
-                                 AP_BROADCAST_PING_SEQUENCE_BASE + (UINT32)i, 0);
+        const ap_request_plan_t broadcast_ping_plan = {
+            .opcode = AP_REQUEST_OP_PING,
+            .service_id = AP_REQUEST_SERVICE_PING,
+            .interface_id = AP_REQUEST_INTERFACE_PING,
+            .sequence = AP_BROADCAST_PING_SEQUENCE_BASE + (UINT32)i,
+        };
+        publish_ap_inbox_request(ctx, AP_BROADCAST_PING_SLOT_INDEX, &broadcast_ping_plan, 0);
         active[i] = 1;
         active_count++;
         ap_broadcast_ping_summary.planned_count++;
@@ -4378,22 +4379,38 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE image, EFI_SYSTEM_TABLE *st) {
         }
     }
     const ap_request_plan_t ap_request_plan[] = {
-        {VIBE_AP_FIRST_REQUEST_OPCODE, VIBE_AP_FIRST_REQUEST_SERVICE_ID,
-         VIBE_AP_FIRST_REQUEST_INTERFACE_ID, 1},
-        {VIBE_AP_SECOND_REQUEST_OPCODE, VIBE_AP_SECOND_REQUEST_SERVICE_ID,
-         VIBE_AP_SECOND_REQUEST_INTERFACE_ID, 2},
-        {VIBE_AP_THIRD_REQUEST_OPCODE, VIBE_AP_THIRD_REQUEST_SERVICE_ID,
-         VIBE_AP_THIRD_REQUEST_INTERFACE_ID, 3},
-        {VIBE_AP_FOURTH_REQUEST_OPCODE, VIBE_AP_FOURTH_REQUEST_SERVICE_ID,
-         VIBE_AP_FOURTH_REQUEST_INTERFACE_ID, 4},
-        {VIBE_AP_SECOND_BATCH_FIRST_REQUEST_OPCODE, VIBE_AP_SECOND_BATCH_FIRST_REQUEST_SERVICE_ID,
-         VIBE_AP_SECOND_BATCH_FIRST_REQUEST_INTERFACE_ID, 5},
-        {VIBE_AP_SECOND_BATCH_SECOND_REQUEST_OPCODE, VIBE_AP_SECOND_BATCH_SECOND_REQUEST_SERVICE_ID,
-         VIBE_AP_SECOND_BATCH_SECOND_REQUEST_INTERFACE_ID, 6},
-        {VIBE_AP_SECOND_BATCH_THIRD_REQUEST_OPCODE, VIBE_AP_SECOND_BATCH_THIRD_REQUEST_SERVICE_ID,
-         VIBE_AP_SECOND_BATCH_THIRD_REQUEST_INTERFACE_ID, 7},
-        {VIBE_AP_SECOND_BATCH_FOURTH_REQUEST_OPCODE, VIBE_AP_SECOND_BATCH_FOURTH_REQUEST_SERVICE_ID,
-         VIBE_AP_SECOND_BATCH_FOURTH_REQUEST_INTERFACE_ID, 8},
+        {.opcode = VIBE_AP_FIRST_REQUEST_OPCODE,
+         .service_id = VIBE_AP_FIRST_REQUEST_SERVICE_ID,
+         .interface_id = VIBE_AP_FIRST_REQUEST_INTERFACE_ID,
+         .sequence = 1},
+        {.opcode = VIBE_AP_SECOND_REQUEST_OPCODE,
+         .service_id = VIBE_AP_SECOND_REQUEST_SERVICE_ID,
+         .interface_id = VIBE_AP_SECOND_REQUEST_INTERFACE_ID,
+         .sequence = 2},
+        {.opcode = VIBE_AP_THIRD_REQUEST_OPCODE,
+         .service_id = VIBE_AP_THIRD_REQUEST_SERVICE_ID,
+         .interface_id = VIBE_AP_THIRD_REQUEST_INTERFACE_ID,
+         .sequence = 3},
+        {.opcode = VIBE_AP_FOURTH_REQUEST_OPCODE,
+         .service_id = VIBE_AP_FOURTH_REQUEST_SERVICE_ID,
+         .interface_id = VIBE_AP_FOURTH_REQUEST_INTERFACE_ID,
+         .sequence = 4},
+        {.opcode = VIBE_AP_SECOND_BATCH_FIRST_REQUEST_OPCODE,
+         .service_id = VIBE_AP_SECOND_BATCH_FIRST_REQUEST_SERVICE_ID,
+         .interface_id = VIBE_AP_SECOND_BATCH_FIRST_REQUEST_INTERFACE_ID,
+         .sequence = 5},
+        {.opcode = VIBE_AP_SECOND_BATCH_SECOND_REQUEST_OPCODE,
+         .service_id = VIBE_AP_SECOND_BATCH_SECOND_REQUEST_SERVICE_ID,
+         .interface_id = VIBE_AP_SECOND_BATCH_SECOND_REQUEST_INTERFACE_ID,
+         .sequence = 6},
+        {.opcode = VIBE_AP_SECOND_BATCH_THIRD_REQUEST_OPCODE,
+         .service_id = VIBE_AP_SECOND_BATCH_THIRD_REQUEST_SERVICE_ID,
+         .interface_id = VIBE_AP_SECOND_BATCH_THIRD_REQUEST_INTERFACE_ID,
+         .sequence = 7},
+        {.opcode = VIBE_AP_SECOND_BATCH_FOURTH_REQUEST_OPCODE,
+         .service_id = VIBE_AP_SECOND_BATCH_FOURTH_REQUEST_SERVICE_ID,
+         .interface_id = VIBE_AP_SECOND_BATCH_FOURTH_REQUEST_INTERFACE_ID,
+         .sequence = 8},
     };
     UINTN ap_request_plan_count = sizeof(ap_request_plan) / sizeof(ap_request_plan[0]);
     build_online_ap_registry(&ap_scheduler, ap_contexts, ap_context_count);

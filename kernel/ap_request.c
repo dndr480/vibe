@@ -29,8 +29,10 @@ void reset_ap_request_slot(ap_request_slot_t *slot) {
     slot->metrics.wait_loops = 0;
 }
 
-void prepare_ap_request_slot(ap_request_slot_t *slot, UINT32 target_cpu, UINT32 opcode,
-                             UINT64 service_id, UINT64 interface_id, UINT32 sequence) {
+void prepare_ap_request_slot_with_envelope(ap_request_slot_t *slot, UINT32 target_cpu,
+                                           UINT32 opcode, UINT64 service_id,
+                                           UINT64 interface_id, UINT32 sequence,
+                                           const ap_request_envelope_t *envelope) {
     slot->metrics.handled_count = 0;
     slot->request.source_cpu = 0;
     slot->request.target_cpu = target_cpu;
@@ -40,13 +42,26 @@ void prepare_ap_request_slot(ap_request_slot_t *slot, UINT32 target_cpu, UINT32 
     slot->request.interface_id = interface_id;
     slot->request.id_high = AP_REQUEST_ID_HIGH_DEFAULT;
     slot->request.id_low = sequence;
-    slot->request.parent_id_high = 0;
-    slot->request.parent_id_low = 0;
-    slot->request.reply_service_id = 0;
-    slot->request.reply_interface_id = 0;
-    slot->request.payload_addr = 0;
-    slot->request.payload_len = 0;
-    slot->request.flags = 0;
+    slot->request.parent_id_high = envelope ? envelope->parent_id_high : 0;
+    slot->request.parent_id_low = envelope ? envelope->parent_id_low : 0;
+    slot->request.reply_service_id = envelope ? envelope->reply_service_id : 0;
+    slot->request.reply_interface_id = envelope ? envelope->reply_interface_id : 0;
+    slot->request.payload_addr = envelope ? envelope->payload_addr : 0;
+    slot->request.payload_len = envelope ? envelope->payload_len : 0;
+    slot->request.flags = envelope ? envelope->flags : 0;
+}
+
+void prepare_ap_request_slot(ap_request_slot_t *slot, UINT32 target_cpu, UINT32 opcode,
+                             UINT64 service_id, UINT64 interface_id, UINT32 sequence) {
+    prepare_ap_request_slot_with_envelope(slot, target_cpu, opcode, service_id, interface_id,
+                                          sequence, 0);
+}
+
+void prepare_ap_request_slot_from_plan(ap_request_slot_t *slot, UINT32 target_cpu,
+                                       const ap_request_plan_t *plan) {
+    prepare_ap_request_slot_with_envelope(slot, target_cpu, plan->opcode, plan->service_id,
+                                          plan->interface_id, plan->sequence,
+                                          &plan->envelope);
 }
 
 void copy_ap_request_slot(ap_request_slot_t *dst, const ap_request_slot_t *src) {

@@ -50,6 +50,15 @@ static void fill_slot(ap_request_slot_t *slot) {
 }
 
 static void test_request_lifecycle(void) {
+    const ap_request_envelope_t envelope = {
+        .parent_id_high = 0x0123456789abcdefULL,
+        .parent_id_low = 0xfedcba9876543210ULL,
+        .reply_service_id = 0x1111222233334444ULL,
+        .reply_interface_id = 0x5555666677778888ULL,
+        .payload_addr = 0x9999aaaabbbbccccULL,
+        .payload_len = 8192,
+        .flags = 0x2468ace0U,
+    };
     ap_request_slot_t slot;
     ap_request_slot_t src;
     ap_request_slot_t dst;
@@ -106,6 +115,80 @@ static void test_request_lifecycle(void) {
     check_int(slot.request.payload_addr == 0, "prepare defaults payload address");
     check_int(slot.request.payload_len == 0, "prepare defaults payload length");
     check_int(slot.request.flags == 0, "prepare defaults flags");
+
+    prepare_ap_request_slot_with_envelope(&slot, 4, AP_REQUEST_OP_COUNTER,
+                                          AP_REQUEST_SERVICE_COUNTER,
+                                          AP_REQUEST_INTERFACE_COUNTER_INCREMENT, 43,
+                                          &envelope);
+    check_int(slot.request.target_cpu == 4, "prepare envelope sets target CPU");
+    check_int(slot.request.opcode == AP_REQUEST_OP_COUNTER, "prepare envelope sets opcode");
+    check_int(slot.request.sequence == 43, "prepare envelope sets sequence");
+    check_int(slot.request.service_id == AP_REQUEST_SERVICE_COUNTER,
+              "prepare envelope sets service");
+    check_int(slot.request.interface_id == AP_REQUEST_INTERFACE_COUNTER_INCREMENT,
+              "prepare envelope sets interface");
+    check_int(slot.request.id_high == 0x41502d50494e4721ULL,
+              "prepare envelope sets request id high");
+    check_int(slot.request.id_low == 43, "prepare envelope sets request id low");
+    check_int(slot.request.parent_id_high == envelope.parent_id_high,
+              "prepare envelope sets parent id high");
+    check_int(slot.request.parent_id_low == envelope.parent_id_low,
+              "prepare envelope sets parent id low");
+    check_int(slot.request.reply_service_id == envelope.reply_service_id,
+              "prepare envelope sets reply service");
+    check_int(slot.request.reply_interface_id == envelope.reply_interface_id,
+              "prepare envelope sets reply interface");
+    check_int(slot.request.payload_addr == envelope.payload_addr,
+              "prepare envelope sets payload address");
+    check_int(slot.request.payload_len == envelope.payload_len,
+              "prepare envelope sets payload length");
+    check_int(slot.request.flags == envelope.flags, "prepare envelope sets flags");
+
+    prepare_ap_request_slot_with_envelope(&slot, 5, AP_REQUEST_OP_PING,
+                                          AP_REQUEST_SERVICE_PING,
+                                          AP_REQUEST_INTERFACE_PING, 44, 0);
+    check_int(slot.request.parent_id_high == 0,
+              "prepare envelope NULL defaults parent id high");
+    check_int(slot.request.parent_id_low == 0,
+              "prepare envelope NULL defaults parent id low");
+    check_int(slot.request.reply_service_id == 0,
+              "prepare envelope NULL defaults reply service");
+    check_int(slot.request.reply_interface_id == 0,
+              "prepare envelope NULL defaults reply interface");
+    check_int(slot.request.payload_addr == 0,
+              "prepare envelope NULL defaults payload address");
+    check_int(slot.request.payload_len == 0,
+              "prepare envelope NULL defaults payload length");
+    check_int(slot.request.flags == 0, "prepare envelope NULL defaults flags");
+
+    const ap_request_plan_t plan = {
+        .opcode = AP_REQUEST_OP_COUNTER,
+        .service_id = AP_REQUEST_SERVICE_COUNTER,
+        .interface_id = AP_REQUEST_INTERFACE_COUNTER_INCREMENT,
+        .sequence = 45,
+        .envelope = envelope,
+    };
+    prepare_ap_request_slot_from_plan(&slot, 6, &plan);
+    check_int(slot.request.target_cpu == 6, "prepare plan sets target CPU");
+    check_int(slot.request.opcode == AP_REQUEST_OP_COUNTER, "prepare plan sets opcode");
+    check_int(slot.request.sequence == 45, "prepare plan sets sequence");
+    check_int(slot.request.service_id == AP_REQUEST_SERVICE_COUNTER,
+              "prepare plan sets service");
+    check_int(slot.request.interface_id == AP_REQUEST_INTERFACE_COUNTER_INCREMENT,
+              "prepare plan sets interface");
+    check_int(slot.request.parent_id_high == envelope.parent_id_high,
+              "prepare plan sets parent id high");
+    check_int(slot.request.parent_id_low == envelope.parent_id_low,
+              "prepare plan sets parent id low");
+    check_int(slot.request.reply_service_id == envelope.reply_service_id,
+              "prepare plan sets reply service");
+    check_int(slot.request.reply_interface_id == envelope.reply_interface_id,
+              "prepare plan sets reply interface");
+    check_int(slot.request.payload_addr == envelope.payload_addr,
+              "prepare plan sets payload address");
+    check_int(slot.request.payload_len == envelope.payload_len,
+              "prepare plan sets payload length");
+    check_int(slot.request.flags == envelope.flags, "prepare plan sets flags");
 
     fill_slot(&src);
     reset_ap_request_slot(&dst);

@@ -58,10 +58,21 @@ typedef struct {
 } ap_request_metrics_t;
 
 typedef struct {
+    UINT64 parent_id_high;
+    UINT64 parent_id_low;
+    UINT64 reply_service_id;
+    UINT64 reply_interface_id;
+    UINT64 payload_addr;
+    UINT32 payload_len;
+    UINT32 flags;
+} ap_request_envelope_t;
+
+typedef struct {
     UINT32 opcode;
     UINT64 service_id;
     UINT64 interface_id;
     UINT32 sequence;
+    ap_request_envelope_t envelope;
 } ap_request_plan_t;
 
 typedef struct {
@@ -74,6 +85,12 @@ typedef struct {
 void reset_ap_request_slot(ap_request_slot_t *slot);
 void prepare_ap_request_slot(ap_request_slot_t *slot, UINT32 target_cpu, UINT32 opcode,
                              UINT64 service_id, UINT64 interface_id, UINT32 sequence);
+void prepare_ap_request_slot_with_envelope(ap_request_slot_t *slot, UINT32 target_cpu,
+                                           UINT32 opcode, UINT64 service_id,
+                                           UINT64 interface_id, UINT32 sequence,
+                                           const ap_request_envelope_t *envelope);
+void prepare_ap_request_slot_from_plan(ap_request_slot_t *slot, UINT32 target_cpu,
+                                       const ap_request_plan_t *plan);
 void copy_ap_request_slot(ap_request_slot_t *dst, const ap_request_slot_t *src);
 
 #endif
