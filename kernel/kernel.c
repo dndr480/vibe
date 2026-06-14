@@ -639,6 +639,12 @@ _Static_assert(__builtin_offsetof(bsp_interrupt_observe_t, idt_self_test) == 0,
                "BSP IDT self-test trace offset must match ISR writes");
 
 typedef struct {
+    interrupt_trace_t spurious;
+} system_interrupt_observe_t;
+_Static_assert(__builtin_offsetof(system_interrupt_observe_t, spurious) == 0,
+               "System spurious trace offset must match ISR writes");
+
+typedef struct {
     volatile UINT32 halt_count;
     volatile UINT32 wake_count;
     volatile UINT32 timer_count;
@@ -683,7 +689,7 @@ static idt_entry_t idt[256];
 static cpu_local_t cpu0;
 static cpu_local_t *current_cpu = &cpu0;
 static bsp_interrupt_observe_t bsp_interrupt_observe;
-static interrupt_trace_t spurious_interrupt_trace;
+static system_interrupt_observe_t system_interrupt_observe;
 static framebuffer_t kernel_framebuffer;
 static UINT32 kernel_bg;
 static UINT32 kernel_fg;
@@ -848,15 +854,15 @@ __asm__(
     "isr_spurious_interrupt:\n"
     "    pushq %rax\n"
     "    movq 8(%rsp), %rax\n"
-    "    movq %rax, spurious_interrupt_trace+8(%rip)\n"
+    "    movq %rax, system_interrupt_observe+8(%rip)\n"
     "    movq 16(%rsp), %rax\n"
-    "    movq %rax, spurious_interrupt_trace+16(%rip)\n"
+    "    movq %rax, system_interrupt_observe+16(%rip)\n"
     "    movq 24(%rsp), %rax\n"
-    "    movq %rax, spurious_interrupt_trace+24(%rip)\n"
-    "    movl $0xff, spurious_interrupt_trace(%rip)\n"
-    "    movl spurious_interrupt_trace+4(%rip), %eax\n"
+    "    movq %rax, system_interrupt_observe+24(%rip)\n"
+    "    movl $0xff, system_interrupt_observe(%rip)\n"
+    "    movl system_interrupt_observe+4(%rip), %eax\n"
     "    addl $1, %eax\n"
-    "    movl %eax, spurious_interrupt_trace+4(%rip)\n"
+    "    movl %eax, system_interrupt_observe+4(%rip)\n"
     "    popq %rax\n"
     "    iretq\n"
     ".global isr_ap_fault_ud\n"
@@ -3986,11 +3992,7 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE image, EFI_SYSTEM_TABLE *st) {
     zero_memory(&ap0->interrupts, sizeof(ap0->interrupts));
     ap_lapic_base = acpi.local_apic_base;
     zero_memory(&bsp_wait_observe, sizeof(bsp_wait_observe));
-    spurious_interrupt_trace.vector = 0;
-    spurious_interrupt_trace.count = 0;
-    spurious_interrupt_trace.rip = 0;
-    spurious_interrupt_trace.cs = 0;
-    spurious_interrupt_trace.rflags = 0;
+    zero_memory(&system_interrupt_observe, sizeof(system_interrupt_observe));
     bring_up_one_ap(ap0, &acpi, &memory_map, &paging);
     const ap_request_plan_t ap_request_plan[] = {
         {VIBE_AP_FIRST_REQUEST_OPCODE, VIBE_AP_FIRST_REQUEST_SERVICE_ID,
