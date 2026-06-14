@@ -1,0 +1,48 @@
+# Repository Instructions
+
+## Commit Workflow
+
+- Treat every code change as a self-contained commit candidate.
+- For each commit, run the full loop before committing:
+  1. Implement the scoped change.
+  2. Run `git diff --check` and `kernel/build-kernel-efi`.
+  3. Do an independent review of the diff without assuming it is correct.
+  4. Fix only real bugs found by review or testing.
+  5. Re-review the changed paths after every fix until the review is clean.
+  6. Run the relevant PXE/hardware scenario on the machine.
+  7. Restore the default EFI build after any temporary test build.
+  8. Confirm `git status -sb` contains only expected changes.
+  9. Commit and push immediately, unless the user explicitly says not to push.
+- Do not batch risk into a later regression pass. A final regression pass may add confidence, but it does not replace per-commit review and hardware validation.
+- Do not make empty commits. If a final review is clean, report that no commit was needed.
+
+## Review Requirements
+
+- Review the actual diff and the affected call paths, not just the intended design.
+- State the concrete failure modes being checked: wrong state owner, stale global access, missed EOI, lost wakeup, bad timeout path, wrong AP target, stale display source, or broken fault attribution.
+- If a bug is fixed, repeat a narrower review of the new control flow and data ownership before testing again.
+- Preserve unrelated user changes. Do not revert files or hunks outside the scoped change.
+
+## Required Validation
+
+- Always run:
+  - `git diff --check`
+  - `kernel/build-kernel-efi`
+- Always run real PXE/hardware validation for code changes that affect kernel behavior.
+- For AP request, AP context, routing, scheduler, broadcast, IPI, LAPIC, timer, queue, or service changes, run the relevant PXE scenarios:
+  - default scheduler PXE
+  - explicit target AP1/AP2 PXE when routing or target selection is affected
+  - AP UD2 smoke when fault handling, service dispatch, or completion paths are affected
+  - HANG short-timeout when timeout, wait, idle, or stopped paths are affected
+- For BSP fault display or BSP CPU/IDT paths, run BSP UD2 smoke.
+- After any temporary compile-time override, rebuild the default EFI with `kernel/build-kernel-efi` before committing.
+
+## Reporting
+
+- Report the exact checks and PXE scenarios run.
+- Include screenshot paths for PXE runs and summarize the key on-screen status lines.
+- After committing, report:
+  - commit hash
+  - push result
+  - `git status -sb`
+  - `git log -1 --oneline`
