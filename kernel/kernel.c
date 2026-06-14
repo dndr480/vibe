@@ -115,6 +115,54 @@ typedef struct {
 #define VIBE_AP_FOURTH_REQUEST_INTERFACE_ID AP_REQUEST_INTERFACE_PING
 #endif
 
+#ifndef VIBE_AP_SECOND_BATCH_FIRST_REQUEST_OPCODE
+#define VIBE_AP_SECOND_BATCH_FIRST_REQUEST_OPCODE AP_REQUEST_OP_PING
+#endif
+
+#ifndef VIBE_AP_SECOND_BATCH_FIRST_REQUEST_SERVICE_ID
+#define VIBE_AP_SECOND_BATCH_FIRST_REQUEST_SERVICE_ID AP_REQUEST_SERVICE_PING
+#endif
+
+#ifndef VIBE_AP_SECOND_BATCH_FIRST_REQUEST_INTERFACE_ID
+#define VIBE_AP_SECOND_BATCH_FIRST_REQUEST_INTERFACE_ID AP_REQUEST_INTERFACE_PING
+#endif
+
+#ifndef VIBE_AP_SECOND_BATCH_SECOND_REQUEST_OPCODE
+#define VIBE_AP_SECOND_BATCH_SECOND_REQUEST_OPCODE AP_REQUEST_OP_COUNTER
+#endif
+
+#ifndef VIBE_AP_SECOND_BATCH_SECOND_REQUEST_SERVICE_ID
+#define VIBE_AP_SECOND_BATCH_SECOND_REQUEST_SERVICE_ID AP_REQUEST_SERVICE_COUNTER
+#endif
+
+#ifndef VIBE_AP_SECOND_BATCH_SECOND_REQUEST_INTERFACE_ID
+#define VIBE_AP_SECOND_BATCH_SECOND_REQUEST_INTERFACE_ID AP_REQUEST_INTERFACE_COUNTER_INCREMENT
+#endif
+
+#ifndef VIBE_AP_SECOND_BATCH_THIRD_REQUEST_OPCODE
+#define VIBE_AP_SECOND_BATCH_THIRD_REQUEST_OPCODE AP_REQUEST_OP_COUNTER
+#endif
+
+#ifndef VIBE_AP_SECOND_BATCH_THIRD_REQUEST_SERVICE_ID
+#define VIBE_AP_SECOND_BATCH_THIRD_REQUEST_SERVICE_ID AP_REQUEST_SERVICE_COUNTER
+#endif
+
+#ifndef VIBE_AP_SECOND_BATCH_THIRD_REQUEST_INTERFACE_ID
+#define VIBE_AP_SECOND_BATCH_THIRD_REQUEST_INTERFACE_ID AP_REQUEST_INTERFACE_COUNTER_INCREMENT
+#endif
+
+#ifndef VIBE_AP_SECOND_BATCH_FOURTH_REQUEST_OPCODE
+#define VIBE_AP_SECOND_BATCH_FOURTH_REQUEST_OPCODE AP_REQUEST_OP_PING
+#endif
+
+#ifndef VIBE_AP_SECOND_BATCH_FOURTH_REQUEST_SERVICE_ID
+#define VIBE_AP_SECOND_BATCH_FOURTH_REQUEST_SERVICE_ID AP_REQUEST_SERVICE_PING
+#endif
+
+#ifndef VIBE_AP_SECOND_BATCH_FOURTH_REQUEST_INTERFACE_ID
+#define VIBE_AP_SECOND_BATCH_FOURTH_REQUEST_INTERFACE_ID AP_REQUEST_INTERFACE_PING
+#endif
+
 #define VIBE_AP_REQUEST_FAULT_TEST_NONE 0
 #define VIBE_AP_REQUEST_FAULT_TEST_UD2 1
 
@@ -1666,8 +1714,8 @@ static void snapshot_ap_request(UINTN index, ap_request_slot_t *slot, UINT32 cou
     __asm__ __volatile__("mfence" : : : "memory");
 }
 
-static void snapshot_ap_requests(ap_request_slot_t *slots, UINTN count) {
-    UINT32 counter_value = 0;
+static void snapshot_ap_requests(ap_request_slot_t *slots, UINTN count, UINT32 counter_base) {
+    UINT32 counter_value = counter_base;
 
     for (UINTN i = 0; i < count && i < AP_REQUEST_SNAPSHOT_COUNT; i++) {
         if (ap_request_is_counter_increment(&slots[i]) &&
@@ -1907,6 +1955,18 @@ static void publish_ap_request_batch(ap_request_slot_t *slots, UINTN slot_count,
     }
 }
 
+static int ap_request_batch_done(ap_request_slot_t *slots, UINTN count) {
+    if (count > AP_REQUEST_SLOT_COUNT) {
+        count = AP_REQUEST_SLOT_COUNT;
+    }
+    for (UINTN i = 0; i < count; i++) {
+        if (slots[i].state != AP_REQUEST_STATUS_DONE) {
+            return 0;
+        }
+    }
+    return 1;
+}
+
 static void wait_for_ap_requests(ap_request_slot_t *slots, UINTN count, ap_boot_info_t *boot) {
     UINT8 wait_recorded[AP_REQUEST_SLOT_COUNT];
     if (count > AP_REQUEST_SLOT_COUNT) {
@@ -1976,6 +2036,19 @@ static void wait_for_ap_requests(ap_request_slot_t *slots, UINTN count, ap_boot_
             (void)cmpxchg_u32(&slot->state, AP_REQUEST_STATUS_RUNNING, AP_REQUEST_STATUS_TIMEOUT);
         }
     }
+}
+
+static int run_ap_request_batch(ap_request_slot_t *slots, UINTN slot_count,
+                                ap_boot_info_t *boot, const ap_request_plan_t *plan,
+                                UINTN plan_count) {
+    UINTN count = slot_count < plan_count ? slot_count : plan_count;
+    UINT32 counter_base = ap_counter_value;
+
+    reset_ap_queue_summary();
+    publish_ap_request_batch(slots, slot_count, boot, plan, plan_count);
+    wait_for_ap_requests(slots, count, boot);
+    snapshot_ap_requests(slots, count, counter_base);
+    return ap_request_batch_done(slots, count);
 }
 
 static void ap_entry_one(void) __attribute__((noreturn));
@@ -3389,7 +3462,7 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE image, EFI_SYSTEM_TABLE *st) {
     ap_request_handled_count = 0;
     ap_counter_value = 0;
     bring_up_one_ap(&ap_boot, &acpi, &memory_map, &paging);
-    const ap_request_plan_t ap_request_plan[AP_REQUEST_SLOT_COUNT] = {
+    const ap_request_plan_t ap_first_batch_plan[AP_REQUEST_SLOT_COUNT] = {
         {VIBE_AP_FIRST_REQUEST_OPCODE, VIBE_AP_FIRST_REQUEST_SERVICE_ID,
          VIBE_AP_FIRST_REQUEST_INTERFACE_ID, 1},
         {VIBE_AP_SECOND_REQUEST_OPCODE, VIBE_AP_SECOND_REQUEST_SERVICE_ID,
@@ -3399,10 +3472,21 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE image, EFI_SYSTEM_TABLE *st) {
         {VIBE_AP_FOURTH_REQUEST_OPCODE, VIBE_AP_FOURTH_REQUEST_SERVICE_ID,
          VIBE_AP_FOURTH_REQUEST_INTERFACE_ID, 4},
     };
-    publish_ap_request_batch(ap_request_slots, AP_REQUEST_SLOT_COUNT, &ap_boot,
-                             ap_request_plan, AP_REQUEST_SLOT_COUNT);
-    wait_for_ap_requests(ap_request_slots, AP_REQUEST_SLOT_COUNT, &ap_boot);
-    snapshot_ap_requests(ap_request_slots, AP_REQUEST_SLOT_COUNT);
+    const ap_request_plan_t ap_second_batch_plan[AP_REQUEST_SLOT_COUNT] = {
+        {VIBE_AP_SECOND_BATCH_FIRST_REQUEST_OPCODE, VIBE_AP_SECOND_BATCH_FIRST_REQUEST_SERVICE_ID,
+         VIBE_AP_SECOND_BATCH_FIRST_REQUEST_INTERFACE_ID, 5},
+        {VIBE_AP_SECOND_BATCH_SECOND_REQUEST_OPCODE, VIBE_AP_SECOND_BATCH_SECOND_REQUEST_SERVICE_ID,
+         VIBE_AP_SECOND_BATCH_SECOND_REQUEST_INTERFACE_ID, 6},
+        {VIBE_AP_SECOND_BATCH_THIRD_REQUEST_OPCODE, VIBE_AP_SECOND_BATCH_THIRD_REQUEST_SERVICE_ID,
+         VIBE_AP_SECOND_BATCH_THIRD_REQUEST_INTERFACE_ID, 7},
+        {VIBE_AP_SECOND_BATCH_FOURTH_REQUEST_OPCODE, VIBE_AP_SECOND_BATCH_FOURTH_REQUEST_SERVICE_ID,
+         VIBE_AP_SECOND_BATCH_FOURTH_REQUEST_INTERFACE_ID, 8},
+    };
+    if (run_ap_request_batch(ap_request_slots, AP_REQUEST_SLOT_COUNT, &ap_boot,
+                             ap_first_batch_plan, AP_REQUEST_SLOT_COUNT)) {
+        (void)run_ap_request_batch(ap_request_slots, AP_REQUEST_SLOT_COUNT, &ap_boot,
+                                   ap_second_batch_plan, AP_REQUEST_SLOT_COUNT);
+    }
 
     clear_screen(&fb, bg);
     draw_memory_map(&fb, &memory_map, &paging, &acpi, &ap_boot,
