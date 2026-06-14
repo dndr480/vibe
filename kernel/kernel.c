@@ -612,6 +612,12 @@ typedef struct {
     volatile UINT32 current_request_slot;
     volatile UINT32 request_handled_count;
     volatile UINT32 counter_value;
+    volatile UINT32 request_kick_ipi_send_count;
+    volatile UINT32 request_kick_ipi_send_fail_count;
+    volatile UINT32 request_ipi_send_count;
+    volatile UINT32 request_ipi_send_fail_count;
+    volatile UINT32 idle_halt_count;
+    volatile UINT32 idle_wake_count;
 } ap_context_t;
 
 typedef struct {
@@ -653,16 +659,10 @@ static uuid128_t current_request_uuid;
 static ap_context_t ap_contexts[1];
 static volatile UINT64 ap_lapic_base;
 static volatile UINT32 ap_bsp_apic_id;
-static volatile UINT32 ap_idle_halt_count;
-static volatile UINT32 ap_idle_wake_count;
 static volatile UINT32 ap_idle_timer_count;
 static volatile UINT32 bsp_wait_halt_count;
 static volatile UINT32 bsp_wait_wake_count;
 static volatile UINT32 bsp_wait_timer_count;
-static volatile UINT32 ap_request_kick_ipi_send_count;
-static volatile UINT32 ap_request_kick_ipi_send_fail_count;
-static volatile UINT32 ap_request_ipi_send_count;
-static volatile UINT32 ap_request_ipi_send_fail_count;
 
 static ap_context_t *ap0_context(void) {
     return &ap_contexts[0];
@@ -1450,14 +1450,15 @@ static void ap_notify_bsp_request_complete(ap_context_t *ctx) {
     __asm__ __volatile__("mfence" : : : "memory");
     enable_lapic_if_needed(base);
     if (lapic_send_ipi(base, apic_id, AP_REQUEST_IPI_VECTOR, boot)) {
-        ap_request_ipi_send_count = ap_request_ipi_send_count + 1U;
+        ctx->request_ipi_send_count = ctx->request_ipi_send_count + 1U;
     } else {
-        ap_request_ipi_send_fail_count = ap_request_ipi_send_fail_count + 1U;
+        ctx->request_ipi_send_fail_count = ctx->request_ipi_send_fail_count + 1U;
     }
 }
 
-static void bsp_notify_ap_request_pending(ap_boot_info_t *boot) {
+static void bsp_notify_ap_request_pending(ap_context_t *ctx) {
     UINT64 base = ap_lapic_base;
+    ap_boot_info_t *boot = &ctx->boot;
     if (base == 0 || boot->error != AP_BOOT_OK || !boot->online ||
         boot->ap_state == AP_BOOT_STATE_HALTED ||
         boot->ap_state == AP_BOOT_STATE_FAULTED) {
@@ -1467,9 +1468,9 @@ static void bsp_notify_ap_request_pending(ap_boot_info_t *boot) {
     __asm__ __volatile__("mfence" : : : "memory");
     enable_lapic_if_needed(base);
     if (lapic_send_ipi(base, boot->target_apic_id, AP_REQUEST_KICK_IPI_VECTOR, boot)) {
-        ap_request_kick_ipi_send_count = ap_request_kick_ipi_send_count + 1U;
+        ctx->request_kick_ipi_send_count = ctx->request_kick_ipi_send_count + 1U;
     } else {
-        ap_request_kick_ipi_send_fail_count = ap_request_kick_ipi_send_fail_count + 1U;
+        ctx->request_kick_ipi_send_fail_count = ctx->request_kick_ipi_send_fail_count + 1U;
     }
 }
 
@@ -2214,10 +2215,10 @@ static void ap_request_loop(void) {
             __asm__ __volatile__("sti; nop; pause; cli" : : : "memory");
             continue;
         }
-        ap_idle_halt_count = ap_idle_halt_count + 1U;
+        ctx->idle_halt_count = ctx->idle_halt_count + 1U;
         __asm__ __volatile__("sti; hlt; cli" : : : "memory");
         ap_disarm_idle_timer();
-        ap_idle_wake_count = ap_idle_wake_count + 1U;
+        ctx->idle_wake_count = ctx->idle_wake_count + 1U;
     }
 }
 
@@ -2234,8 +2235,9 @@ static void prepare_ap_request(ap_request_slot_t *slot, UINT32 opcode, UINT64 se
     slot->request.id_low = sequence;
 }
 
-static void publish_ap_request(ap_request_slot_t *slot, ap_boot_info_t *boot, UINT32 opcode,
+static void publish_ap_request(ap_context_t *ctx, ap_request_slot_t *slot, UINT32 opcode,
                                UINT64 service_id, UINT64 interface_id, UINT32 sequence) {
+    ap_boot_info_t *boot = &ctx->boot;
     reset_ap_request_slot(slot);
     prepare_ap_request(slot, opcode, service_id, interface_id, sequence);
     if (boot->ap_state == AP_BOOT_STATE_FAULTED) {
@@ -2256,7 +2258,7 @@ static void publish_ap_request(ap_request_slot_t *slot, ap_boot_info_t *boot, UI
     __asm__ __volatile__("mfence" : : : "memory");
     slot->state = AP_REQUEST_STATUS_PENDING;
     __asm__ __volatile__("mfence" : : : "memory");
-    bsp_notify_ap_request_pending(boot);
+    bsp_notify_ap_request_pending(ctx);
 }
 
 static int ap_request_all_done(ap_request_slot_t *slots, UINTN count) {
@@ -2294,16 +2296,17 @@ static void record_ap_stream_slot(ap_context_t *ctx, UINTN history_index, UINTN 
     record_ap_request_history(ctx, history_index, slot_index, slot, *counter_value);
 }
 
-static void publish_ap_stream_slot(ap_request_slot_t *slots, UINT8 *active,
-                                   UINTN slot_index, ap_boot_info_t *boot,
+static void publish_ap_stream_slot(ap_context_t *ctx, ap_request_slot_t *slots, UINT8 *active,
+                                   UINTN slot_index,
                                    const ap_request_plan_t *plan) {
-    publish_ap_request(&slots[slot_index], boot, plan->opcode, plan->service_id,
+    publish_ap_request(ctx, &slots[slot_index], plan->opcode, plan->service_id,
                        plan->interface_id, plan->sequence);
     active[slot_index] = 1;
 }
 
-static void stop_ap_request_stream(ap_request_slot_t *slots, UINTN count, UINT8 *active,
-                                   ap_boot_info_t *boot, UINT32 wait_loops) {
+static void stop_ap_request_stream(ap_context_t *ctx, ap_request_slot_t *slots, UINTN count,
+                                   UINT8 *active, UINT32 wait_loops) {
+    ap_boot_info_t *boot = &ctx->boot;
     for (UINTN slot_index = 0; slot_index < count; slot_index++) {
         if (!active[slot_index]) {
             continue;
@@ -2345,7 +2348,8 @@ static int ap_request_stream_has_finished_slot(ap_request_slot_t *slots, UINT8 *
     return 0;
 }
 
-static int ap_request_stream_should_stop(ap_boot_info_t *boot) {
+static int ap_request_stream_should_stop(ap_context_t *ctx) {
+    ap_boot_info_t *boot = &ctx->boot;
     return boot->ap_state == AP_BOOT_STATE_FAULTED ||
            boot->ap_state == AP_BOOT_STATE_HALTED;
 }
@@ -2393,7 +2397,7 @@ static void finish_timed_out_ap_stream_slots(ap_context_t *ctx, ap_request_slot_
     }
 }
 
-static int run_ap_request_stream(ap_context_t *ctx, ap_boot_info_t *boot, const ap_request_plan_t *plan,
+static int run_ap_request_stream(ap_context_t *ctx, const ap_request_plan_t *plan,
                                  UINTN plan_count) {
     UINT8 active[AP_REQUEST_SLOT_COUNT];
     ap_request_slot_t *slots = ctx->request_slots;
@@ -2417,16 +2421,16 @@ static int run_ap_request_stream(ap_context_t *ctx, ap_boot_info_t *boot, const 
     }
 
     for (UINTN slot_index = 0; slot_index < count && next_plan < plan_count; slot_index++) {
-        publish_ap_stream_slot(slots, active, slot_index, boot, &plan[next_plan]);
+        publish_ap_stream_slot(ctx, slots, active, slot_index, &plan[next_plan]);
         next_plan++;
     }
 
     __asm__ __volatile__("cli" : : : "memory");
     UINT32 wait_loops = 0;
     for (;;) {
-        if (ap_request_stream_should_stop(boot)) {
+        if (ap_request_stream_should_stop(ctx)) {
             stopped = 1;
-            stop_ap_request_stream(slots, count, active, boot, wait_loops);
+            stop_ap_request_stream(ctx, slots, count, active, wait_loops);
         }
 
         for (UINTN slot_index = 0; slot_index < count; slot_index++) {
@@ -2440,17 +2444,17 @@ static int run_ap_request_stream(ap_context_t *ctx, ap_boot_info_t *boot, const 
             }
             if (done && !stopped && wait_loops < AP_REQUEST_TIMEOUT_LOOPS &&
                 next_plan < plan_count) {
-                if (ap_request_stream_should_stop(boot)) {
+                if (ap_request_stream_should_stop(ctx)) {
                     stopped = 1;
                 } else {
-                    publish_ap_stream_slot(slots, active, slot_index, boot, &plan[next_plan]);
+                    publish_ap_stream_slot(ctx, slots, active, slot_index, &plan[next_plan]);
                     next_plan++;
                 }
             }
         }
 
         if (stopped) {
-            stop_ap_request_stream(slots, count, active, boot, wait_loops);
+            stop_ap_request_stream(ctx, slots, count, active, wait_loops);
         }
         UINT32 active_count = active_ap_request_slot_count(active, count);
         if ((next_plan >= plan_count || stopped) && active_count == 0) {
@@ -3376,8 +3380,9 @@ static void draw_ap_boot_info(framebuffer_t *fb, UINT32 *y, ap_boot_info_t *boot
     }
 }
 
-static void draw_ap_queue_summary(framebuffer_t *fb, UINT32 *y, ap_queue_summary_t *queue,
+static void draw_ap_queue_summary(framebuffer_t *fb, UINT32 *y, ap_context_t *ctx,
                                   UINT32 fg, UINT32 accent, UINT32 warn, UINT32 bg) {
+    ap_queue_summary_t *queue = &ctx->queue_summary;
     char line[192];
     char *p = append_str(line, "AP QUEUE: HANDLED ");
     p = append_dec(p, queue->handled_count);
@@ -3397,10 +3402,10 @@ static void draw_ap_queue_summary(framebuffer_t *fb, UINT32 *y, ap_queue_summary
     p = append_dec(p, ap_request_ipi_trace.count);
     *p++ = '/';
     *p = 0;
-    p = append_dec(p, ap_request_ipi_send_count);
+    p = append_dec(p, ctx->request_ipi_send_count);
     *p++ = '/';
     *p = 0;
-    append_dec(p, ap_request_ipi_send_fail_count);
+    append_dec(p, ctx->request_ipi_send_fail_count);
 
     UINT32 color = fg;
     if (queue->stop_reason == AP_QUEUE_STOP_DRAINED) {
@@ -3412,29 +3417,33 @@ static void draw_ap_queue_summary(framebuffer_t *fb, UINT32 *y, ap_queue_summary
     draw_line(fb, 48, y, line, color, bg, 2);
 }
 
-static void draw_ap_kick_summary(framebuffer_t *fb, UINT32 *y, UINT32 fg, UINT32 accent,
-                                 UINT32 warn, UINT32 bg) {
+static void draw_ap_kick_summary(framebuffer_t *fb, UINT32 *y, ap_context_t *ctx,
+                                 UINT32 fg, UINT32 accent, UINT32 warn, UINT32 bg) {
+    UINT32 kick_send_count = ctx ? ctx->request_kick_ipi_send_count : 0;
+    UINT32 kick_send_fail_count = ctx ? ctx->request_kick_ipi_send_fail_count : 0;
+    UINT32 idle_halt_count = ctx ? ctx->idle_halt_count : 0;
+    UINT32 idle_wake_count = ctx ? ctx->idle_wake_count : 0;
     char line[192];
     char *p = append_str(line, "AP KICK: RX/TX/FAIL: ");
     p = append_dec(p, ap_request_kick_ipi_trace.count);
     *p++ = '/';
     *p = 0;
-    p = append_dec(p, ap_request_kick_ipi_send_count);
+    p = append_dec(p, kick_send_count);
     *p++ = '/';
     *p = 0;
-    append_dec(p, ap_request_kick_ipi_send_fail_count);
+    append_dec(p, kick_send_fail_count);
 
-    UINT32 color = ap_request_kick_ipi_send_fail_count ? warn : fg;
-    if (ap_request_kick_ipi_send_count && !ap_request_kick_ipi_send_fail_count) {
+    UINT32 color = kick_send_fail_count ? warn : fg;
+    if (kick_send_count && !kick_send_fail_count) {
         color = accent;
     }
     draw_line(fb, 48, y, line, color, bg, 2);
 
     p = append_str(line, "AP IDLE: HALT/WAKE/TIMER: ");
-    p = append_dec(p, ap_idle_halt_count);
+    p = append_dec(p, idle_halt_count);
     *p++ = '/';
     *p = 0;
-    p = append_dec(p, ap_idle_wake_count);
+    p = append_dec(p, idle_wake_count);
     *p++ = '/';
     *p = 0;
     append_dec(p, ap_idle_timer_count);
@@ -3632,9 +3641,9 @@ static void draw_memory_map(framebuffer_t *fb, efi_memory_map_t *map, paging_inf
     if (ap) {
         draw_ap_boot_info(fb, &y, ap, fg, accent, warn, bg);
         if (ap_context) {
-            draw_ap_queue_summary(fb, &y, &ap_context->queue_summary, fg, accent, warn, bg);
+            draw_ap_queue_summary(fb, &y, ap_context, fg, accent, warn, bg);
         }
-        draw_ap_kick_summary(fb, &y, fg, accent, warn, bg);
+        draw_ap_kick_summary(fb, &y, ap_context, fg, accent, warn, bg);
         if (ap_context) {
             draw_ap_request_history(fb, &y, ap_context->request_history,
                                     AP_REQUEST_HISTORY_COUNT, fg, accent, warn, bg);
@@ -3939,10 +3948,14 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE image, EFI_SYSTEM_TABLE *st) {
     ap0->current_request_slot = AP_REQUEST_NO_SLOT;
     ap0->request_handled_count = 0;
     ap0->counter_value = 0;
+    ap0->request_kick_ipi_send_count = 0;
+    ap0->request_kick_ipi_send_fail_count = 0;
+    ap0->request_ipi_send_count = 0;
+    ap0->request_ipi_send_fail_count = 0;
+    ap0->idle_halt_count = 0;
+    ap0->idle_wake_count = 0;
     ap_lapic_base = acpi.local_apic_base;
     ap_bsp_apic_id = acpi.bsp_apic_id;
-    ap_idle_halt_count = 0;
-    ap_idle_wake_count = 0;
     ap_idle_timer_count = 0;
     bsp_wait_halt_count = 0;
     bsp_wait_wake_count = 0;
@@ -3962,10 +3975,6 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE image, EFI_SYSTEM_TABLE *st) {
     spurious_interrupt_trace.rip = 0;
     spurious_interrupt_trace.cs = 0;
     spurious_interrupt_trace.rflags = 0;
-    ap_request_kick_ipi_send_count = 0;
-    ap_request_kick_ipi_send_fail_count = 0;
-    ap_request_ipi_send_count = 0;
-    ap_request_ipi_send_fail_count = 0;
     bring_up_one_ap(ap0, &acpi, &memory_map, &paging);
     const ap_request_plan_t ap_request_plan[] = {
         {VIBE_AP_FIRST_REQUEST_OPCODE, VIBE_AP_FIRST_REQUEST_SERVICE_ID,
@@ -3985,7 +3994,7 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE image, EFI_SYSTEM_TABLE *st) {
         {VIBE_AP_SECOND_BATCH_FOURTH_REQUEST_OPCODE, VIBE_AP_SECOND_BATCH_FOURTH_REQUEST_SERVICE_ID,
          VIBE_AP_SECOND_BATCH_FOURTH_REQUEST_INTERFACE_ID, 8},
     };
-    (void)run_ap_request_stream(ap0, &ap0->boot, ap_request_plan,
+    (void)run_ap_request_stream(ap0, ap_request_plan,
                                 sizeof(ap_request_plan) / sizeof(ap_request_plan[0]));
 
     clear_screen(&fb, bg);
