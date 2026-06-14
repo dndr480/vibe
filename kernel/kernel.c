@@ -2079,6 +2079,21 @@ static void reset_ap_request_slot(ap_request_slot_t *slot) {
     slot->metrics.wait_loops = 0;
 }
 
+static ap_request_slot_t *ap_inbox_slot(ap_context_t *ctx, UINTN slot_index) {
+    return &ctx->request_slots[slot_index];
+}
+
+static UINTN ap_inbox_slot_limit(UINTN count) {
+    if (count > AP_REQUEST_SLOT_COUNT) {
+        return AP_REQUEST_SLOT_COUNT;
+    }
+    return count;
+}
+
+static void reset_ap_inbox_slot(ap_context_t *ctx, UINTN slot_index) {
+    reset_ap_request_slot(ap_inbox_slot(ctx, slot_index));
+}
+
 static void copy_ap_request_slot(ap_request_slot_t *dst, ap_request_slot_t *src) {
     dst->state = src->state;
     dst->request.source_cpu = src->request.source_cpu;
@@ -2165,7 +2180,7 @@ static int ap_queue_all_other_slots_done(ap_context_t *ctx, UINTN current_slot) 
         if (i == current_slot) {
             continue;
         }
-        if (ctx->request_slots[i].state != AP_REQUEST_STATUS_DONE) {
+        if (ap_inbox_slot(ctx, i)->state != AP_REQUEST_STATUS_DONE) {
             return 0;
         }
     }
@@ -2283,7 +2298,7 @@ static void ap_request_loop(ap_context_t *ctx) {
         int handled_work = 0;
         __asm__ __volatile__("cli" : : : "memory");
         for (UINTN i = 0; i < AP_REQUEST_SLOT_COUNT; i++) {
-            ap_request_slot_t *slot = &ctx->request_slots[i];
+            ap_request_slot_t *slot = ap_inbox_slot(ctx, i);
             if (slot->state != AP_REQUEST_STATUS_PENDING) {
                 continue;
             }
@@ -2353,11 +2368,12 @@ static void prepare_ap_request(ap_request_slot_t *slot, UINT32 target_cpu, UINT3
     slot->request.id_low = sequence;
 }
 
-static void publish_ap_request(ap_context_t *ctx, ap_request_slot_t *slot, UINT32 opcode,
-                               UINT64 service_id, UINT64 interface_id, UINT32 sequence,
-                               int send_kick) {
+static void publish_ap_inbox_request(ap_context_t *ctx, UINTN slot_index, UINT32 opcode,
+                                     UINT64 service_id, UINT64 interface_id, UINT32 sequence,
+                                     int send_kick) {
     ap_boot_info_t *boot = &ctx->boot;
-    reset_ap_request_slot(slot);
+    ap_request_slot_t *slot = ap_inbox_slot(ctx, slot_index);
+    reset_ap_inbox_slot(ctx, slot_index);
     prepare_ap_request(slot, ap_context_index(ctx) + 1U, opcode, service_id,
                        interface_id, sequence);
     if (boot->ap_state == AP_BOOT_STATE_FAULTED) {
@@ -2401,13 +2417,6 @@ static void drain_ap_request_ipis(void) {
     }
 }
 
-static UINTN ap_request_slot_limit(UINTN count) {
-    if (count > AP_REQUEST_SLOT_COUNT) {
-        return AP_REQUEST_SLOT_COUNT;
-    }
-    return count;
-}
-
 static void record_ap_stream_slot(ap_context_t *ctx, UINTN history_index, UINTN slot_index,
                                   ap_request_slot_t *slot, UINT32 *counter_value) {
     if (ap_request_is_counter_increment(slot) &&
@@ -2418,11 +2427,10 @@ static void record_ap_stream_slot(ap_context_t *ctx, UINTN history_index, UINTN 
     record_ap_request_history(ctx, history_index, slot_index, slot, *counter_value);
 }
 
-static void publish_ap_stream_slot(ap_context_t *ctx, ap_request_slot_t *slots, UINT8 *active,
-                                   UINTN slot_index,
+static void publish_ap_stream_slot(ap_context_t *ctx, UINT8 *active, UINTN slot_index,
                                    const ap_request_plan_t *plan) {
-    publish_ap_request(ctx, &slots[slot_index], plan->opcode, plan->service_id,
-                       plan->interface_id, plan->sequence, 1);
+    publish_ap_inbox_request(ctx, slot_index, plan->opcode, plan->service_id,
+                             plan->interface_id, plan->sequence, 1);
     active[slot_index] = 1;
 }
 
@@ -2523,7 +2531,7 @@ static int run_ap_request_stream(ap_context_t *ctx, const ap_request_plan_t *pla
                                  UINTN plan_count) {
     UINT8 active[AP_REQUEST_SLOT_COUNT];
     ap_request_slot_t *slots = ctx->request_slots;
-    UINTN count = ap_request_slot_limit(AP_REQUEST_SLOT_COUNT);
+    UINTN count = ap_inbox_slot_limit(AP_REQUEST_SLOT_COUNT);
     UINTN next_plan = 0;
     UINTN completed_count = 0;
     UINT32 counter_base = ctx->counter_value;
@@ -2539,7 +2547,7 @@ static int run_ap_request_stream(ap_context_t *ctx, const ap_request_plan_t *pla
     ctx->queue_summary.planned_count = (UINT32)plan_count;
     for (UINTN i = 0; i < AP_REQUEST_SLOT_COUNT; i++) {
         active[i] = 0;
-        reset_ap_request_slot(&slots[i]);
+        reset_ap_inbox_slot(ctx, i);
     }
 
     if (ap_request_stream_should_stop(ctx)) {
@@ -2553,7 +2561,7 @@ static int run_ap_request_stream(ap_context_t *ctx, const ap_request_plan_t *pla
     }
 
     for (UINTN slot_index = 0; slot_index < count && next_plan < plan_count; slot_index++) {
-        publish_ap_stream_slot(ctx, slots, active, slot_index, &plan[next_plan]);
+        publish_ap_stream_slot(ctx, active, slot_index, &plan[next_plan]);
         next_plan++;
     }
 
@@ -2579,7 +2587,7 @@ static int run_ap_request_stream(ap_context_t *ctx, const ap_request_plan_t *pla
                 if (ap_request_stream_should_stop(ctx)) {
                     stopped = 1;
                 } else {
-                    publish_ap_stream_slot(ctx, slots, active, slot_index, &plan[next_plan]);
+                    publish_ap_stream_slot(ctx, active, slot_index, &plan[next_plan]);
                     next_plan++;
                 }
             }
@@ -2707,10 +2715,9 @@ static void run_ap_broadcast_ping(ap_context_t *contexts, UINTN context_count,
             continue;
         }
 
-        ap_request_slot_t *slot = &ctx->request_slots[AP_BROADCAST_PING_SLOT_INDEX];
-        publish_ap_request(ctx, slot, AP_REQUEST_OP_PING, AP_REQUEST_SERVICE_PING,
-                           AP_REQUEST_INTERFACE_PING,
-                           AP_BROADCAST_PING_SEQUENCE_BASE + (UINT32)i, 0);
+        publish_ap_inbox_request(ctx, AP_BROADCAST_PING_SLOT_INDEX, AP_REQUEST_OP_PING,
+                                 AP_REQUEST_SERVICE_PING, AP_REQUEST_INTERFACE_PING,
+                                 AP_BROADCAST_PING_SEQUENCE_BASE + (UINT32)i, 0);
         active[i] = 1;
         active_count++;
         ap_broadcast_ping_summary.planned_count++;
@@ -2724,7 +2731,7 @@ static void run_ap_broadcast_ping(ap_context_t *contexts, UINTN context_count,
                 continue;
             }
 
-            ap_request_slot_t *slot = &contexts[i].request_slots[AP_BROADCAST_PING_SLOT_INDEX];
+            ap_request_slot_t *slot = ap_inbox_slot(&contexts[i], AP_BROADCAST_PING_SLOT_INDEX);
             if (!ap_request_state_finished(slot->state)) {
                 continue;
             }
@@ -2749,7 +2756,7 @@ static void run_ap_broadcast_ping(ap_context_t *contexts, UINTN context_count,
                 continue;
             }
 
-            ap_request_slot_t *slot = &contexts[i].request_slots[AP_BROADCAST_PING_SLOT_INDEX];
+            ap_request_slot_t *slot = ap_inbox_slot(&contexts[i], AP_BROADCAST_PING_SLOT_INDEX);
             timeout_ap_broadcast_ping_slot(slot);
             record_ap_broadcast_ping_result(i, &contexts[i], slot, AP_REQUEST_TIMEOUT_LOOPS);
             active[i] = 0;
@@ -2777,7 +2784,7 @@ static void init_ap_context(ap_context_t *ctx, ap_boot_info_t *trampoline_boot,
     ctx->boot.sipi_vector = trampoline_boot->sipi_vector;
     ctx->boot.error = trampoline_boot->error;
     for (UINTN i = 0; i < AP_REQUEST_SLOT_COUNT; i++) {
-        reset_ap_request_slot(&ctx->request_slots[i]);
+        reset_ap_inbox_slot(ctx, i);
     }
     reset_ap_request_history(ctx);
     reset_ap_queue_summary(ctx);
