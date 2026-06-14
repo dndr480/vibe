@@ -645,6 +645,40 @@ static ap_context_t *ap0_context(void) {
     return &ap_contexts[0];
 }
 
+static int ap_context_is_ap0(ap_context_t *ctx) {
+    return ctx == &ap_contexts[0];
+}
+
+static UINT32 ap_context_index(ap_context_t *ctx) {
+    for (UINT32 i = 0; i < MAX_AP_CONTEXTS; i++) {
+        if (ctx == &ap_contexts[i]) {
+            return i;
+        }
+    }
+    return 0;
+}
+
+static int address_in_range(UINT64 addr, UINT64 start, UINT64 size) {
+    return addr >= start && addr < start + size;
+}
+
+static ap_context_t *ap_context_from_fault_frame(fault_frame_t *frame) {
+    UINT64 frame_addr = (UINT64)(UINTN)frame;
+
+    for (UINTN i = 0; i < MAX_AP_CONTEXTS; i++) {
+        cpu_local_t *cpu = &ap_contexts[i].cpu;
+        UINT64 fault_stack = (UINT64)(UINTN)cpu->fault_stack;
+        UINT64 double_fault_stack = (UINT64)(UINTN)cpu->double_fault_stack;
+
+        if (address_in_range(frame_addr, fault_stack, sizeof(cpu->fault_stack)) ||
+            address_in_range(frame_addr, double_fault_stack, sizeof(cpu->double_fault_stack))) {
+            return &ap_contexts[i];
+        }
+    }
+
+    return ap0_context();
+}
+
 static int cmpxchg_u32(volatile UINT32 *ptr, UINT32 expected, UINT32 desired);
 static void enable_lapic_if_needed(UINT64 base);
 static void lapic_write32(UINT64 base, UINT32 reg, UINT32 value);
@@ -1519,7 +1553,7 @@ void fault_dispatch(fault_frame_t *frame) {
 void ap_fault_dispatch(fault_frame_t *frame) {
     __asm__ __volatile__("cli" : : : "memory");
 
-    ap_context_t *ctx = ap0_context();
+    ap_context_t *ctx = ap_context_from_fault_frame(frame);
     ap_boot_info_t *boot = &ctx->boot;
     UINT32 slot_index = ctx->current_request_slot;
     ap_request_slot_t *slot = slot_index < AP_REQUEST_SLOT_COUNT ?
@@ -2055,9 +2089,8 @@ static UINT32 bsp_wait_for_ap_request_event(void) {
     return 1;
 }
 
-static void ap_request_loop(void) __attribute__((noreturn));
-static void ap_request_loop(void) {
-    ap_context_t *ctx = ap0_context();
+static void ap_request_loop(ap_context_t *ctx) __attribute__((noreturn));
+static void ap_request_loop(ap_context_t *ctx) {
     ap_boot_info_t *boot = &ctx->boot;
     ap_service_context_t service_context = {
         &ctx->request_handled_count,
@@ -2119,7 +2152,7 @@ static void ap_request_loop(void) {
         if (handled_work) {
             continue;
         }
-        if (!ap_arm_idle_timer()) {
+        if (!ap_context_is_ap0(ctx) || !ap_arm_idle_timer()) {
             __asm__ __volatile__("sti; nop; pause; cli" : : : "memory");
             continue;
         }
@@ -2398,18 +2431,38 @@ static int run_ap_request_stream(ap_context_t *ctx, const ap_request_plan_t *pla
     return completed_count == plan_count && ap_request_all_done(slots, count);
 }
 
-static void ap_entry_one(void) __attribute__((noreturn));
-static void ap_entry_one(void) {
+static void init_ap_context(ap_context_t *ctx, ap_boot_info_t *trampoline_boot,
+                            UINT32 completion_target_apic_id) {
+    zero_memory(ctx, sizeof(*ctx));
+    ctx->boot.trampoline_base = trampoline_boot->trampoline_base;
+    ctx->boot.sipi_vector = trampoline_boot->sipi_vector;
+    ctx->boot.error = trampoline_boot->error;
+    for (UINTN i = 0; i < AP_REQUEST_SLOT_COUNT; i++) {
+        reset_ap_request_slot(&ctx->request_slots[i]);
+    }
+    reset_ap_request_history(ctx);
+    reset_ap_queue_summary(ctx);
+    ctx->current_request_slot = AP_REQUEST_NO_SLOT;
+    ctx->completion_target_apic_id = completion_target_apic_id;
+}
+
+static void init_ap_contexts(ap_boot_info_t *trampoline_boot, UINT32 completion_target_apic_id) {
+    for (UINTN i = 0; i < MAX_AP_CONTEXTS; i++) {
+        init_ap_context(&ap_contexts[i], trampoline_boot, completion_target_apic_id);
+    }
+}
+
+static void ap_entry_one(ap_context_t *ctx) __attribute__((noreturn));
+static void ap_entry_one(ap_context_t *ctx) {
     descriptor_table_ptr_t gdtr;
     descriptor_table_ptr_t idtr;
-    ap_context_t *ctx = ap0_context();
     ap_boot_info_t *boot = &ctx->boot;
     cpu_local_t *cpu = &ctx->cpu;
 
     __asm__ __volatile__("cli" : : : "memory");
     boot->entry_state = AP_ENTRY_STATE_C;
 
-    init_cpu_local(cpu, 1);
+    init_cpu_local(cpu, ap_context_index(ctx) + 1U);
     load_cpu_tables(cpu);
     init_ap_idt(ctx);
     load_idt_entries(ctx->idt);
@@ -2433,7 +2486,7 @@ static void ap_entry_one(void) {
                     idtr.limit == (UINT16)(sizeof(ctx->idt) - 1)) ? 1U : 0U;
     boot->entry_state = AP_ENTRY_STATE_TABLES;
     run_ap_fault_test_if_enabled();
-    ap_request_loop();
+    ap_request_loop(ctx);
 }
 
 static int run_idt_self_test(void) {
@@ -2845,14 +2898,38 @@ static EFI_STATUS allocate_ap_trampoline(EFI_BOOT_SERVICES *bs, ap_boot_info_t *
     return EFI_SUCCESS;
 }
 
-static int select_ap_target(acpi_info_t *acpi, ap_boot_info_t *boot) {
+static int acpi_cpu_is_supported_ap(acpi_info_t *acpi, acpi_cpu_t *cpu) {
+    return !cpu->x2apic && cpu->apic_id != acpi->bsp_apic_id && cpu->apic_id < 256;
+}
+
+static UINTN count_supported_ap_targets(acpi_info_t *acpi) {
     if (acpi->error != ACPI_OK) {
         return 0;
     }
 
+    UINTN count = 0;
+    for (UINT32 i = 0; i < acpi->stored_cpu_count; i++) {
+        if (acpi_cpu_is_supported_ap(acpi, &acpi->cpus[i])) {
+            count++;
+        }
+    }
+
+    return count;
+}
+
+static int select_ap_target(acpi_info_t *acpi, UINTN target_index, ap_boot_info_t *boot) {
+    if (acpi->error != ACPI_OK) {
+        return 0;
+    }
+
+    UINTN supported_index = 0;
     for (UINT32 i = 0; i < acpi->stored_cpu_count; i++) {
         acpi_cpu_t *cpu = &acpi->cpus[i];
-        if (!cpu->x2apic && cpu->apic_id != acpi->bsp_apic_id && cpu->apic_id < 256) {
+        if (acpi_cpu_is_supported_ap(acpi, cpu)) {
+            if (supported_index != target_index) {
+                supported_index++;
+                continue;
+            }
             boot->target_acpi_uid = cpu->acpi_uid;
             boot->target_apic_id = cpu->apic_id;
             return 1;
@@ -2926,6 +3003,8 @@ static int build_ap_trampoline(ap_context_t *ctx, paging_info_t *paging) {
     emit8(&p, 0x8e); emit8(&p, 0xd0);        /* mov ss, eax */
     emit_mov_rax_imm64(&p, boot->stack_top);
     emit8(&p, 0x48); emit8(&p, 0x89); emit8(&p, 0xc4); /* mov rsp, rax */
+    emit_mov_rax_imm64(&p, (UINT64)(UINTN)ctx);
+    emit8(&p, 0x48); emit8(&p, 0x89); emit8(&p, 0xc7); /* mov rdi, rax */
     emit_mov_rax_imm64(&p, (UINT64)(UINTN)ap_entry_one);
     emit8(&p, 0xff); emit8(&p, 0xd0);        /* call rax */
     emit8(&p, 0xfa);                         /* cli */
@@ -2997,8 +3076,8 @@ static void enable_lapic_if_needed(UINT64 base) {
     }
 }
 
-static void bring_up_one_ap(ap_context_t *ctx, acpi_info_t *acpi, efi_memory_map_t *map,
-                            paging_info_t *paging) {
+static void bring_up_one_ap(ap_context_t *ctx, UINTN target_index, acpi_info_t *acpi,
+                            efi_memory_map_t *map, paging_info_t *paging) {
     ap_boot_info_t *boot = &ctx->boot;
     boot->online = 0;
     boot->ap_state = AP_BOOT_STATE_NONE;
@@ -3024,13 +3103,15 @@ static void bring_up_one_ap(ap_context_t *ctx, acpi_info_t *acpi, efi_memory_map
     boot->fault_request_interface_id = 0;
     boot->fault_request_id_high = 0;
     boot->fault_request_id_low = 0;
+    boot->target_acpi_uid = 0;
+    boot->target_apic_id = 0;
     boot->wait_loops = 0;
     boot->icr_timeouts = 0;
 
     if (boot->error != AP_BOOT_OK) {
         return;
     }
-    if (!select_ap_target(acpi, boot)) {
+    if (!select_ap_target(acpi, target_index, boot)) {
         boot->error = AP_BOOT_ERR_NO_TARGET;
         return;
     }
@@ -3457,10 +3538,47 @@ static UINT32 memory_line_color(EFI_MEMORY_DESCRIPTOR *desc, UINT32 fg, UINT32 m
     }
 }
 
+static void draw_ap_context_summary(framebuffer_t *fb, UINT32 *y, ap_context_t *contexts,
+                                    UINTN context_count, UINT32 fg, UINT32 accent,
+                                    UINT32 warn, UINT32 bg) {
+    char line[192];
+    char *p = append_str(line, "AP ONLINE: ");
+    UINT32 online_count = 0;
+    if (context_count > MAX_AP_CONTEXTS) {
+        context_count = MAX_AP_CONTEXTS;
+    }
+
+    for (UINTN i = 0; i < context_count; i++) {
+        if (contexts[i].boot.online) {
+            online_count++;
+        }
+    }
+
+    p = append_dec(p, online_count);
+    *p++ = '/';
+    *p = 0;
+    p = append_dec(p, (UINT32)context_count);
+    p = append_str(p, "  APIC:");
+    if (context_count == 0) {
+        p = append_str(p, " NONE");
+    }
+    for (UINTN i = 0; i < context_count; i++) {
+        *p++ = ' ';
+        *p = 0;
+        p = append_dec(p, contexts[i].boot.target_apic_id);
+        if (!contexts[i].boot.online) {
+            p = append_str(p, "!");
+        }
+    }
+
+    UINT32 color = (context_count > 0 && online_count == context_count) ? accent : warn;
+    draw_line(fb, 48, y, line, color ? color : fg, bg, 2);
+}
+
 static void draw_memory_map(framebuffer_t *fb, efi_memory_map_t *map, paging_info_t *paging,
                             acpi_info_t *acpi, ap_boot_info_t *ap,
-                            ap_context_t *ap_context, UINT32 fg, UINT32 muted, UINT32 accent,
-                            UINT32 warn, UINT32 bg) {
+                            ap_context_t *ap_contexts, UINTN ap_context_count,
+                            UINT32 fg, UINT32 muted, UINT32 accent, UINT32 warn, UINT32 bg) {
     UINT64 conventional_pages = 0;
     UINT64 loader_pages = 0;
     UINT64 boot_pages = 0;
@@ -3551,13 +3669,16 @@ static void draw_memory_map(framebuffer_t *fb, efi_memory_map_t *map, paging_inf
     }
 
     if (ap) {
-        draw_ap_boot_info(fb, &y, ap, fg, accent, warn, bg);
-        if (ap_context) {
-            draw_ap_queue_summary(fb, &y, ap_context, fg, accent, warn, bg);
+        if (ap_contexts) {
+            draw_ap_context_summary(fb, &y, ap_contexts, ap_context_count, fg, accent, warn, bg);
         }
-        draw_ap_kick_summary(fb, &y, ap_context, fg, accent, warn, bg);
-        if (ap_context) {
-            draw_ap_request_history(fb, &y, ap_context->request_history,
+        draw_ap_boot_info(fb, &y, ap, fg, accent, warn, bg);
+        if (ap_contexts) {
+            draw_ap_queue_summary(fb, &y, &ap_contexts[0], fg, accent, warn, bg);
+        }
+        draw_ap_kick_summary(fb, &y, ap_contexts ? &ap_contexts[0] : 0, fg, accent, warn, bg);
+        if (ap_contexts) {
+            draw_ap_request_history(fb, &y, ap_contexts[0].request_history,
                                     AP_REQUEST_HISTORY_COUNT, fg, accent, warn, bg);
         }
         y += 8;
@@ -3805,9 +3926,9 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE image, EFI_SYSTEM_TABLE *st) {
     fb.size = gop->Mode->FrameBufferSize;
     fb.format = gop->Mode->Info->PixelFormat;
 
-    ap_context_t *ap0 = ap0_context();
     UINT64 acpi_rsdp = find_acpi_rsdp(st);
-    allocate_ap_trampoline(bs, &ap0->boot);
+    ap_boot_info_t trampoline_boot;
+    allocate_ap_trampoline(bs, &trampoline_boot);
 
     efi_memory_map_t memory_map;
     memory_map.descriptors = 0;
@@ -3849,26 +3970,22 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE image, EFI_SYSTEM_TABLE *st) {
     paging.idt_self_test_ok = run_idt_self_test() ? 1U : 0U;
     acpi_info_t acpi;
     parse_acpi(acpi_rsdp, &memory_map, &acpi);
-    for (UINTN i = 0; i < AP_REQUEST_SLOT_COUNT; i++) {
-        reset_ap_request_slot(&ap0->request_slots[i]);
+    init_ap_contexts(&trampoline_boot, acpi.bsp_apic_id);
+    ap_context_t *ap0 = ap0_context();
+    UINTN ap_context_count = count_supported_ap_targets(&acpi);
+    if (ap_context_count > MAX_AP_CONTEXTS) {
+        ap_context_count = MAX_AP_CONTEXTS;
     }
-    reset_ap_request_history(ap0);
-    reset_ap_queue_summary(ap0);
-    ap0->current_request_slot = AP_REQUEST_NO_SLOT;
-    ap0->request_handled_count = 0;
-    ap0->counter_value = 0;
-    ap0->request_kick_ipi_send_count = 0;
-    ap0->request_kick_ipi_send_fail_count = 0;
-    ap0->request_ipi_send_count = 0;
-    ap0->request_ipi_send_fail_count = 0;
-    ap0->idle_halt_count = 0;
-    ap0->idle_wake_count = 0;
-    ap0->completion_target_apic_id = acpi.bsp_apic_id;
-    zero_memory(&ap0->interrupts, sizeof(ap0->interrupts));
     system_lapic_base = acpi.local_apic_base;
     zero_memory(&bsp_wait_observe, sizeof(bsp_wait_observe));
     zero_memory(&system_interrupt_observe, sizeof(system_interrupt_observe));
-    bring_up_one_ap(ap0, &acpi, &memory_map, &paging);
+    if (ap_context_count == 0) {
+        bring_up_one_ap(ap0, 0, &acpi, &memory_map, &paging);
+    } else {
+        for (UINTN i = 0; i < ap_context_count; i++) {
+            bring_up_one_ap(&ap_contexts[i], i, &acpi, &memory_map, &paging);
+        }
+    }
     const ap_request_plan_t ap_request_plan[] = {
         {VIBE_AP_FIRST_REQUEST_OPCODE, VIBE_AP_FIRST_REQUEST_SERVICE_ID,
          VIBE_AP_FIRST_REQUEST_INTERFACE_ID, 1},
@@ -3891,7 +4008,8 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE image, EFI_SYSTEM_TABLE *st) {
                                 sizeof(ap_request_plan) / sizeof(ap_request_plan[0]));
 
     clear_screen(&fb, bg);
-    draw_memory_map(&fb, &memory_map, &paging, &acpi, &ap0->boot, ap0,
+    draw_memory_map(&fb, &memory_map, &paging, &acpi, &ap0->boot,
+                    ap_contexts, ap_context_count,
                     fg, muted, accent, warn, bg);
     run_fault_test_if_enabled();
 
