@@ -604,6 +604,7 @@ typedef struct {
 } ap_queue_summary_t;
 
 typedef struct {
+    ap_boot_info_t boot;
     ap_request_slot_t request_slots[AP_REQUEST_SLOT_COUNT];
     ap_request_history_entry_t request_history[AP_REQUEST_HISTORY_COUNT];
     ap_queue_summary_t queue_summary;
@@ -648,7 +649,6 @@ static UINT32 kernel_fg;
 static UINT32 kernel_accent;
 static UINT32 kernel_warn;
 static uuid128_t current_request_uuid;
-static ap_boot_info_t ap_boot;
 static ap_context_t ap_contexts[1];
 static volatile UINT64 ap_lapic_base;
 static volatile UINT32 ap_bsp_apic_id;
@@ -672,7 +672,7 @@ static int cmpxchg_u32(volatile UINT32 *ptr, UINT32 expected, UINT32 desired);
 static void enable_lapic_if_needed(UINT64 base);
 static void lapic_write32(UINT64 base, UINT32 reg, UINT32 value);
 static int lapic_send_ipi(UINT64 base, UINT32 apic_id, UINT32 command, ap_boot_info_t *boot);
-static void ap_notify_bsp_request_complete(void);
+static void ap_notify_bsp_request_complete(ap_context_t *ctx);
 static UINT64 read_rflags(void);
 
 extern void isr_breakpoint(void);
@@ -1439,16 +1439,17 @@ static char *append_uuid128(char *p, uuid128_t uuid) {
     return append_hex64(p, uuid.low);
 }
 
-static void ap_notify_bsp_request_complete(void) {
+static void ap_notify_bsp_request_complete(ap_context_t *ctx) {
     UINT64 base = ap_lapic_base;
     UINT32 apic_id = ap_bsp_apic_id;
+    ap_boot_info_t *boot = &ctx->boot;
     if (base == 0) {
         return;
     }
 
     __asm__ __volatile__("mfence" : : : "memory");
     enable_lapic_if_needed(base);
-    if (lapic_send_ipi(base, apic_id, AP_REQUEST_IPI_VECTOR, &ap_boot)) {
+    if (lapic_send_ipi(base, apic_id, AP_REQUEST_IPI_VECTOR, boot)) {
         ap_request_ipi_send_count = ap_request_ipi_send_count + 1U;
     } else {
         ap_request_ipi_send_fail_count = ap_request_ipi_send_fail_count + 1U;
@@ -1544,33 +1545,34 @@ void ap_fault_dispatch(fault_frame_t *frame) {
     __asm__ __volatile__("cli" : : : "memory");
 
     ap_context_t *ctx = ap0_context();
+    ap_boot_info_t *boot = &ctx->boot;
     UINT32 slot_index = ctx->current_request_slot;
     ap_request_slot_t *slot = slot_index < AP_REQUEST_SLOT_COUNT ?
                               &ctx->request_slots[slot_index] : 0;
     UINT32 request_state = slot ? slot->state : AP_REQUEST_STATUS_EMPTY;
     UINT32 fault_phase = AP_FAULT_PHASE_STARTUP;
     if (slot &&
-        (ap_boot.entry_state == AP_ENTRY_STATE_REQUEST ||
+        (boot->entry_state == AP_ENTRY_STATE_REQUEST ||
          request_state == AP_REQUEST_STATUS_RUNNING)) {
         fault_phase = AP_FAULT_PHASE_REQUEST;
-    } else if (ap_boot.entry_state == AP_ENTRY_STATE_LOOP) {
+    } else if (boot->entry_state == AP_ENTRY_STATE_LOOP) {
         fault_phase = AP_FAULT_PHASE_LOOP;
     }
 
-    ap_boot.fault_vector = frame->vector;
-    ap_boot.fault_error_code = frame->error_code;
-    ap_boot.fault_rip = frame->rip;
-    ap_boot.fault_cs = frame->cs;
-    ap_boot.fault_rflags = frame->rflags;
-    ap_boot.fault_cr2 = read_cr2();
-    ap_boot.fault_phase = fault_phase;
-    ap_boot.fault_request_state = request_state;
-    ap_boot.fault_request_opcode = slot ? slot->request.opcode : AP_REQUEST_OP_NONE;
-    ap_boot.fault_request_sequence = slot ? slot->request.sequence : 0;
-    ap_boot.fault_request_service_id = slot ? slot->request.service_id : 0;
-    ap_boot.fault_request_interface_id = slot ? slot->request.interface_id : 0;
-    ap_boot.fault_request_id_high = slot ? slot->request.id_high : 0;
-    ap_boot.fault_request_id_low = slot ? slot->request.id_low : 0;
+    boot->fault_vector = frame->vector;
+    boot->fault_error_code = frame->error_code;
+    boot->fault_rip = frame->rip;
+    boot->fault_cs = frame->cs;
+    boot->fault_rflags = frame->rflags;
+    boot->fault_cr2 = read_cr2();
+    boot->fault_phase = fault_phase;
+    boot->fault_request_state = request_state;
+    boot->fault_request_opcode = slot ? slot->request.opcode : AP_REQUEST_OP_NONE;
+    boot->fault_request_sequence = slot ? slot->request.sequence : 0;
+    boot->fault_request_service_id = slot ? slot->request.service_id : 0;
+    boot->fault_request_interface_id = slot ? slot->request.interface_id : 0;
+    boot->fault_request_id_high = slot ? slot->request.id_high : 0;
+    boot->fault_request_id_low = slot ? slot->request.id_low : 0;
     if (slot &&
         (request_state == AP_REQUEST_STATUS_EMPTY ||
          request_state == AP_REQUEST_STATUS_PENDING ||
@@ -1597,11 +1599,11 @@ void ap_fault_dispatch(fault_frame_t *frame) {
         }
     }
     __asm__ __volatile__("mfence" : : : "memory");
-    ap_boot.entry_state = AP_ENTRY_STATE_FAULT;
-    ap_boot.ap_state = AP_BOOT_STATE_FAULTED;
+    boot->entry_state = AP_ENTRY_STATE_FAULT;
+    boot->ap_state = AP_BOOT_STATE_FAULTED;
     __asm__ __volatile__("mfence" : : : "memory");
-    ap_notify_bsp_request_complete();
-    ap_boot.online = 1;
+    ap_notify_bsp_request_complete(ctx);
+    boot->online = 1;
 
     for (;;) {
         __asm__ __volatile__("hlt" : : : "memory");
@@ -2151,11 +2153,12 @@ static UINT32 bsp_wait_for_ap_request_event(void) {
 static void ap_request_loop(void) __attribute__((noreturn));
 static void ap_request_loop(void) {
     ap_context_t *ctx = ap0_context();
+    ap_boot_info_t *boot = &ctx->boot;
 
-    ap_boot.ap_state = AP_BOOT_STATE_ONLINE;
-    ap_boot.entry_state = AP_ENTRY_STATE_LOOP;
+    boot->ap_state = AP_BOOT_STATE_ONLINE;
+    boot->entry_state = AP_ENTRY_STATE_LOOP;
     __asm__ __volatile__("mfence" : : : "memory");
-    ap_boot.online = 1;
+    boot->online = 1;
 
     for (;;) {
         int handled_work = 0;
@@ -2175,29 +2178,29 @@ static void ap_request_loop(void) {
             ap_queue_note_slot_start(ctx, i);
             slot->metrics.handled_count = ctx->request_handled_count;
             begin_ap_reply(slot);
-            ap_boot.entry_state = AP_ENTRY_STATE_REQUEST;
+            boot->entry_state = AP_ENTRY_STATE_REQUEST;
             __asm__ __volatile__("mfence" : : : "memory");
 
             ap_request_handler_t handler = find_ap_request_handler(slot->request.service_id,
                                                                    slot->request.interface_id);
             if (handler) {
                 handler(ctx, slot);
-                ap_boot.ap_state = AP_BOOT_STATE_ONLINE;
-                ap_boot.entry_state = AP_ENTRY_STATE_LOOP;
+                boot->ap_state = AP_BOOT_STATE_ONLINE;
+                boot->entry_state = AP_ENTRY_STATE_LOOP;
                 ap_queue_note_slot_terminal(ctx, i, AP_REQUEST_STATUS_DONE, AP_QUEUE_STOP_NONE);
                 ctx->current_request_slot = AP_REQUEST_NO_SLOT;
                 complete_ap_request(slot, AP_REQUEST_STATUS_DONE);
-                ap_notify_bsp_request_complete();
+                ap_notify_bsp_request_complete(ctx);
             } else {
                 slot->reply.result_code = ap_dispatch_miss_result_code(slot->request.service_id,
                                                                        slot->request.interface_id);
                 slot->reply.fault_code = 0;
-                ap_boot.ap_state = AP_BOOT_STATE_HALTED;
-                ap_boot.entry_state = AP_ENTRY_STATE_HALTED;
+                boot->ap_state = AP_BOOT_STATE_HALTED;
+                boot->entry_state = AP_ENTRY_STATE_HALTED;
                 ap_queue_note_slot_terminal(ctx, i, AP_REQUEST_STATUS_BAD_OP, AP_QUEUE_STOP_BAD_OP);
                 ctx->current_request_slot = AP_REQUEST_NO_SLOT;
                 complete_ap_request(slot, AP_REQUEST_STATUS_BAD_OP);
-                ap_notify_bsp_request_complete();
+                ap_notify_bsp_request_complete(ctx);
                 ap_disarm_idle_timer();
                 for (;;) {
                     __asm__ __volatile__("cli; hlt" : : : "memory");
@@ -2487,9 +2490,11 @@ static void ap_entry_one(void) __attribute__((noreturn));
 static void ap_entry_one(void) {
     descriptor_table_ptr_t gdtr;
     descriptor_table_ptr_t idtr;
+    ap_context_t *ctx = ap0_context();
+    ap_boot_info_t *boot = &ctx->boot;
 
     __asm__ __volatile__("cli" : : : "memory");
-    ap_boot.entry_state = AP_ENTRY_STATE_C;
+    boot->entry_state = AP_ENTRY_STATE_C;
 
     init_cpu_local(&cpu1, 1);
     load_cpu_tables(&cpu1);
@@ -2503,17 +2508,17 @@ static void ap_entry_one(void) {
     store_gdtr(&gdtr);
     store_idtr(&idtr);
 
-    ap_boot.ap_cs = read_cs();
-    ap_boot.ap_tr = read_tr();
-    ap_boot.ap_ist1 = cpu1.tss.ist[CPU_IST_FAULT - 1];
-    ap_boot.ap_ist2 = cpu1.tss.ist[CPU_IST_DOUBLE_FAULT - 1];
-    ap_boot.gdt_ok = (gdtr.base == (UINT64)(UINTN)cpu1.gdt &&
-                      gdtr.limit == (UINT16)(sizeof(cpu1.gdt) - 1)) ? 1U : 0U;
-    ap_boot.tss_ok = (ap_boot.ap_tr == KERNEL_TSS_SELECTOR && cpu1.tss_ready &&
-                      ap_boot.ap_ist1 != 0 && ap_boot.ap_ist2 != 0) ? 1U : 0U;
-    ap_boot.idt_ok = (idtr.base == (UINT64)(UINTN)ap_idt &&
-                      idtr.limit == (UINT16)(sizeof(ap_idt) - 1)) ? 1U : 0U;
-    ap_boot.entry_state = AP_ENTRY_STATE_TABLES;
+    boot->ap_cs = read_cs();
+    boot->ap_tr = read_tr();
+    boot->ap_ist1 = cpu1.tss.ist[CPU_IST_FAULT - 1];
+    boot->ap_ist2 = cpu1.tss.ist[CPU_IST_DOUBLE_FAULT - 1];
+    boot->gdt_ok = (gdtr.base == (UINT64)(UINTN)cpu1.gdt &&
+                    gdtr.limit == (UINT16)(sizeof(cpu1.gdt) - 1)) ? 1U : 0U;
+    boot->tss_ok = (boot->ap_tr == KERNEL_TSS_SELECTOR && cpu1.tss_ready &&
+                    boot->ap_ist1 != 0 && boot->ap_ist2 != 0) ? 1U : 0U;
+    boot->idt_ok = (idtr.base == (UINT64)(UINTN)ap_idt &&
+                    idtr.limit == (UINT16)(sizeof(ap_idt) - 1)) ? 1U : 0U;
+    boot->entry_state = AP_ENTRY_STATE_TABLES;
     run_ap_fault_test_if_enabled();
     ap_request_loop();
 }
@@ -3876,8 +3881,9 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE image, EFI_SYSTEM_TABLE *st) {
     fb.size = gop->Mode->FrameBufferSize;
     fb.format = gop->Mode->Info->PixelFormat;
 
+    ap_context_t *ap0 = ap0_context();
     UINT64 acpi_rsdp = find_acpi_rsdp(st);
-    allocate_ap_trampoline(bs, &ap_boot);
+    allocate_ap_trampoline(bs, &ap0->boot);
 
     efi_memory_map_t memory_map;
     memory_map.descriptors = 0;
@@ -3922,7 +3928,6 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE image, EFI_SYSTEM_TABLE *st) {
     paging.idt_self_test_ok = run_idt_self_test() ? 1U : 0U;
     acpi_info_t acpi;
     parse_acpi(acpi_rsdp, &memory_map, &acpi);
-    ap_context_t *ap0 = ap0_context();
     for (UINTN i = 0; i < AP_REQUEST_SLOT_COUNT; i++) {
         reset_ap_request_slot(&ap0->request_slots[i]);
     }
@@ -3958,7 +3963,7 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE image, EFI_SYSTEM_TABLE *st) {
     ap_request_kick_ipi_send_fail_count = 0;
     ap_request_ipi_send_count = 0;
     ap_request_ipi_send_fail_count = 0;
-    bring_up_one_ap(&ap_boot, &acpi, &memory_map, &paging);
+    bring_up_one_ap(&ap0->boot, &acpi, &memory_map, &paging);
     const ap_request_plan_t ap_request_plan[] = {
         {VIBE_AP_FIRST_REQUEST_OPCODE, VIBE_AP_FIRST_REQUEST_SERVICE_ID,
          VIBE_AP_FIRST_REQUEST_INTERFACE_ID, 1},
@@ -3977,11 +3982,11 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE image, EFI_SYSTEM_TABLE *st) {
         {VIBE_AP_SECOND_BATCH_FOURTH_REQUEST_OPCODE, VIBE_AP_SECOND_BATCH_FOURTH_REQUEST_SERVICE_ID,
          VIBE_AP_SECOND_BATCH_FOURTH_REQUEST_INTERFACE_ID, 8},
     };
-    (void)run_ap_request_stream(ap0, &ap_boot, ap_request_plan,
+    (void)run_ap_request_stream(ap0, &ap0->boot, ap_request_plan,
                                 sizeof(ap_request_plan) / sizeof(ap_request_plan[0]));
 
     clear_screen(&fb, bg);
-    draw_memory_map(&fb, &memory_map, &paging, &acpi, &ap_boot, ap0,
+    draw_memory_map(&fb, &memory_map, &paging, &acpi, &ap0->boot, ap0,
                     fg, muted, accent, warn, bg);
     run_fault_test_if_enabled();
 
