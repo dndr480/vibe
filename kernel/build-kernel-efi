@@ -8,21 +8,29 @@ out="${1:-$repo_dir/pxenode1/pxe/www/kernel/kernel.efi}"
 
 mkdir -p "$build_dir" "$(dirname -- "$out")"
 
-gcc \
-  -std=c11 \
-  -Wall \
-  -Wextra \
-  -ffreestanding \
-  -fshort-wchar \
-  -fno-stack-protector \
-  -fno-stack-check \
-  -fno-asynchronous-unwind-tables \
-  -fno-ident \
-  -fpic \
-  -mno-red-zone \
-  -maccumulate-outgoing-args \
-  -c "$script_dir/kernel.c" \
-  -o "$build_dir/kernel.o"
+c_sources=("$script_dir"/*.c)
+objects=()
+
+for src in "${c_sources[@]}"; do
+  obj="$build_dir/$(basename -- "${src%.c}").o"
+  objects+=("$obj")
+
+  gcc \
+    -std=c11 \
+    -Wall \
+    -Wextra \
+    -ffreestanding \
+    -fshort-wchar \
+    -fno-stack-protector \
+    -fno-stack-check \
+    -fno-asynchronous-unwind-tables \
+    -fno-ident \
+    -fpic \
+    -mno-red-zone \
+    -maccumulate-outgoing-args \
+    -c "$src" \
+    -o "$obj"
+done
 
 ld \
   -mi386pep \
@@ -30,7 +38,7 @@ ld \
   -dll \
   -nostdlib \
   -e efi_main \
-  "$build_dir/kernel.o" \
+  "${objects[@]}" \
   -o "$build_dir/kernel.efi"
 
 strip "$build_dir/kernel.efi"
