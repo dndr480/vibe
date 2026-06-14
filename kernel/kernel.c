@@ -604,10 +604,40 @@ typedef struct {
 } ap_queue_summary_t;
 
 typedef struct {
+    volatile UINT32 vector;
+    volatile UINT32 count;
+    volatile UINT64 rip;
+    volatile UINT64 cs;
+    volatile UINT64 rflags;
+} interrupt_trace_t;
+_Static_assert(sizeof(interrupt_trace_t) == 32, "interrupt trace layout must match ISR writes");
+_Static_assert(__builtin_offsetof(interrupt_trace_t, count) == 4,
+               "interrupt trace count offset must match ISR writes");
+_Static_assert(__builtin_offsetof(interrupt_trace_t, rip) == 8,
+               "interrupt trace RIP offset must match ISR writes");
+_Static_assert(__builtin_offsetof(interrupt_trace_t, cs) == 16,
+               "interrupt trace CS offset must match ISR writes");
+_Static_assert(__builtin_offsetof(interrupt_trace_t, rflags) == 24,
+               "interrupt trace RFLAGS offset must match ISR writes");
+
+typedef struct {
+    interrupt_trace_t kick_ipi;
+    interrupt_trace_t completion_ipi;
+    volatile UINT32 idle_timer_count;
+} ap_interrupt_observe_t;
+_Static_assert(__builtin_offsetof(ap_interrupt_observe_t, kick_ipi) == 0,
+               "AP kick IPI trace offset must match ISR writes");
+_Static_assert(__builtin_offsetof(ap_interrupt_observe_t, completion_ipi) == 32,
+               "AP completion IPI trace offset must match ISR writes");
+_Static_assert(__builtin_offsetof(ap_interrupt_observe_t, idle_timer_count) == 64,
+               "AP idle timer count offset must match ISR writes");
+
+typedef struct {
     ap_boot_info_t boot;
     UINT8 boot_stack[AP_BOOT_STACK_SIZE] __attribute__((aligned(16)));
     cpu_local_t cpu;
     idt_entry_t idt[256];
+    ap_interrupt_observe_t interrupts;
     ap_request_slot_t request_slots[AP_REQUEST_SLOT_COUNT];
     ap_request_history_entry_t request_history[AP_REQUEST_HISTORY_COUNT];
     ap_queue_summary_t queue_summary;
@@ -621,14 +651,6 @@ typedef struct {
     volatile UINT32 idle_halt_count;
     volatile UINT32 idle_wake_count;
 } ap_context_t;
-
-typedef struct {
-    volatile UINT32 vector;
-    volatile UINT32 count;
-    volatile UINT64 rip;
-    volatile UINT64 cs;
-    volatile UINT64 rflags;
-} interrupt_trace_t;
 
 typedef struct {
     UINT64 vector;
@@ -647,8 +669,6 @@ static idt_entry_t idt[256];
 static cpu_local_t cpu0;
 static cpu_local_t *current_cpu = &cpu0;
 static interrupt_trace_t interrupt_trace;
-static interrupt_trace_t ap_request_kick_ipi_trace;
-static interrupt_trace_t ap_request_ipi_trace;
 static interrupt_trace_t spurious_interrupt_trace;
 static framebuffer_t kernel_framebuffer;
 static UINT32 kernel_bg;
@@ -657,9 +677,9 @@ static UINT32 kernel_accent;
 static UINT32 kernel_warn;
 static uuid128_t current_request_uuid;
 static ap_context_t ap_contexts[1];
+static ap_interrupt_observe_t *ap0_interrupts __attribute__((used)) = &ap_contexts[0].interrupts;
 static volatile UINT64 ap_lapic_base;
 static volatile UINT32 ap_bsp_apic_id;
-static volatile UINT32 ap_idle_timer_count;
 static volatile UINT32 bsp_wait_halt_count;
 static volatile UINT32 bsp_wait_wake_count;
 static volatile UINT32 bsp_wait_timer_count;
@@ -746,49 +766,54 @@ __asm__(
     ".global isr_ap_request_kick_ipi\n"
     "isr_ap_request_kick_ipi:\n"
     "    pushq %rax\n"
-    "    movq 8(%rsp), %rax\n"
-    "    movq %rax, ap_request_kick_ipi_trace+8(%rip)\n"
-    "    movq 16(%rsp), %rax\n"
-    "    movq %rax, ap_request_kick_ipi_trace+16(%rip)\n"
-    "    movq 24(%rsp), %rax\n"
-    "    movq %rax, ap_request_kick_ipi_trace+24(%rip)\n"
-    "    movl $0xf0, ap_request_kick_ipi_trace(%rip)\n"
-    "    movl ap_request_kick_ipi_trace+4(%rip), %eax\n"
-    "    addl $1, %eax\n"
-    "    movl %eax, ap_request_kick_ipi_trace+4(%rip)\n"
+    "    pushq %rdx\n"
+    "    movq ap0_interrupts(%rip), %rax\n"
+    "    movq 16(%rsp), %rdx\n"
+    "    movq %rdx, 8(%rax)\n"
+    "    movq 24(%rsp), %rdx\n"
+    "    movq %rdx, 16(%rax)\n"
+    "    movq 32(%rsp), %rdx\n"
+    "    movq %rdx, 24(%rax)\n"
+    "    movl $0xf0, (%rax)\n"
+    "    movl 4(%rax), %edx\n"
+    "    addl $1, %edx\n"
+    "    movl %edx, 4(%rax)\n"
     "    movq ap_lapic_base(%rip), %rax\n"
     "    testq %rax, %rax\n"
     "    jz 6f\n"
     "    movl $0, 0xb0(%rax)\n"
     "6:\n"
+    "    popq %rdx\n"
     "    popq %rax\n"
     "    iretq\n"
     ".global isr_ap_request_ipi\n"
     "isr_ap_request_ipi:\n"
     "    pushq %rax\n"
-    "    movq 8(%rsp), %rax\n"
-    "    movq %rax, ap_request_ipi_trace+8(%rip)\n"
-    "    movq 16(%rsp), %rax\n"
-    "    movq %rax, ap_request_ipi_trace+16(%rip)\n"
-    "    movq 24(%rsp), %rax\n"
-    "    movq %rax, ap_request_ipi_trace+24(%rip)\n"
-    "    movl $0xf1, ap_request_ipi_trace(%rip)\n"
-    "    movl ap_request_ipi_trace+4(%rip), %eax\n"
-    "    addl $1, %eax\n"
-    "    movl %eax, ap_request_ipi_trace+4(%rip)\n"
+    "    pushq %rdx\n"
+    "    movq ap0_interrupts(%rip), %rax\n"
+    "    movq 16(%rsp), %rdx\n"
+    "    movq %rdx, 40(%rax)\n"
+    "    movq 24(%rsp), %rdx\n"
+    "    movq %rdx, 48(%rax)\n"
+    "    movq 32(%rsp), %rdx\n"
+    "    movq %rdx, 56(%rax)\n"
+    "    movl $0xf1, 32(%rax)\n"
+    "    movl 36(%rax), %edx\n"
+    "    addl $1, %edx\n"
+    "    movl %edx, 36(%rax)\n"
     "    movq ap_lapic_base(%rip), %rax\n"
     "    testq %rax, %rax\n"
     "    jz 5f\n"
     "    movl $0, 0xb0(%rax)\n"
     "5:\n"
+    "    popq %rdx\n"
     "    popq %rax\n"
     "    iretq\n"
     ".global isr_ap_idle_timer\n"
     "isr_ap_idle_timer:\n"
     "    pushq %rax\n"
-    "    movl ap_idle_timer_count(%rip), %eax\n"
-    "    addl $1, %eax\n"
-    "    movl %eax, ap_idle_timer_count(%rip)\n"
+    "    movq ap0_interrupts(%rip), %rax\n"
+    "    addl $1, 64(%rax)\n"
     "    movq ap_lapic_base(%rip), %rax\n"
     "    testq %rax, %rax\n"
     "    jz 7f\n"
@@ -3401,7 +3426,7 @@ static void draw_ap_queue_summary(framebuffer_t *fb, UINT32 *y, ap_context_t *ct
     p = append_str(p, "  CURRENT: ");
     p = append_dec(p, queue->current_slot);
     p = append_str(p, "  IPI RX/TX/FAIL: ");
-    p = append_dec(p, ap_request_ipi_trace.count);
+    p = append_dec(p, ctx->interrupts.completion_ipi.count);
     *p++ = '/';
     *p = 0;
     p = append_dec(p, ctx->request_ipi_send_count);
@@ -3421,13 +3446,15 @@ static void draw_ap_queue_summary(framebuffer_t *fb, UINT32 *y, ap_context_t *ct
 
 static void draw_ap_kick_summary(framebuffer_t *fb, UINT32 *y, ap_context_t *ctx,
                                  UINT32 fg, UINT32 accent, UINT32 warn, UINT32 bg) {
+    UINT32 kick_rx_count = ctx ? ctx->interrupts.kick_ipi.count : 0;
     UINT32 kick_send_count = ctx ? ctx->request_kick_ipi_send_count : 0;
     UINT32 kick_send_fail_count = ctx ? ctx->request_kick_ipi_send_fail_count : 0;
     UINT32 idle_halt_count = ctx ? ctx->idle_halt_count : 0;
     UINT32 idle_wake_count = ctx ? ctx->idle_wake_count : 0;
+    UINT32 idle_timer_count = ctx ? ctx->interrupts.idle_timer_count : 0;
     char line[192];
     char *p = append_str(line, "AP KICK: RX/TX/FAIL: ");
-    p = append_dec(p, ap_request_kick_ipi_trace.count);
+    p = append_dec(p, kick_rx_count);
     *p++ = '/';
     *p = 0;
     p = append_dec(p, kick_send_count);
@@ -3448,7 +3475,7 @@ static void draw_ap_kick_summary(framebuffer_t *fb, UINT32 *y, ap_context_t *ctx
     p = append_dec(p, idle_wake_count);
     *p++ = '/';
     *p = 0;
-    append_dec(p, ap_idle_timer_count);
+    append_dec(p, idle_timer_count);
     draw_line(fb, 48, y, line, fg, bg, 2);
 
     p = append_str(line, "BSP WAIT: HALT/WAKE/TIMER: ");
@@ -3956,22 +3983,12 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE image, EFI_SYSTEM_TABLE *st) {
     ap0->request_ipi_send_fail_count = 0;
     ap0->idle_halt_count = 0;
     ap0->idle_wake_count = 0;
+    zero_memory(&ap0->interrupts, sizeof(ap0->interrupts));
     ap_lapic_base = acpi.local_apic_base;
     ap_bsp_apic_id = acpi.bsp_apic_id;
-    ap_idle_timer_count = 0;
     bsp_wait_halt_count = 0;
     bsp_wait_wake_count = 0;
     bsp_wait_timer_count = 0;
-    ap_request_kick_ipi_trace.vector = 0;
-    ap_request_kick_ipi_trace.count = 0;
-    ap_request_kick_ipi_trace.rip = 0;
-    ap_request_kick_ipi_trace.cs = 0;
-    ap_request_kick_ipi_trace.rflags = 0;
-    ap_request_ipi_trace.vector = 0;
-    ap_request_ipi_trace.count = 0;
-    ap_request_ipi_trace.rip = 0;
-    ap_request_ipi_trace.cs = 0;
-    ap_request_ipi_trace.rflags = 0;
     spurious_interrupt_trace.vector = 0;
     spurious_interrupt_trace.count = 0;
     spurious_interrupt_trace.rip = 0;
