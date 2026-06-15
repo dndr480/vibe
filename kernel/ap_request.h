@@ -7,6 +7,7 @@
 #define AP_REQUEST_INTERFACE_PING 0x41502d4946430001ULL
 #define AP_REQUEST_SERVICE_COUNTER 0x41502d5356430002ULL
 #define AP_REQUEST_INTERFACE_COUNTER_INCREMENT 0x41502d4946430002ULL
+#define AP_REQUEST_OUTBOX_CAPACITY 4U
 
 enum {
     AP_REQUEST_STATUS_EMPTY = 0,
@@ -76,6 +77,11 @@ typedef struct {
 } ap_request_plan_t;
 
 typedef struct {
+    UINT32 count;
+    ap_request_plan_t entries[AP_REQUEST_OUTBOX_CAPACITY];
+} ap_request_outbox_t;
+
+typedef struct {
     volatile UINT32 state;
     ap_request_header_t request;
     ap_reply_header_t reply;
@@ -92,5 +98,7 @@ void prepare_ap_request_slot_with_envelope(ap_request_slot_t *slot, UINT32 targe
 void prepare_ap_request_slot_from_plan(ap_request_slot_t *slot, UINT32 target_cpu,
                                        const ap_request_plan_t *plan);
 void copy_ap_request_slot(ap_request_slot_t *dst, const ap_request_slot_t *src);
+void reset_ap_request_outbox(ap_request_outbox_t *outbox);
+int append_ap_request_outbox(ap_request_outbox_t *outbox, const ap_request_plan_t *plan);
 
 #endif

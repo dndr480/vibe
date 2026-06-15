@@ -112,3 +112,10 @@ UINT32 ap_dispatch_miss_result_code(UINT64 service_id, UINT64 interface_id) {
     }
     return (UINT32)interface_id;
 }
+
+int ap_service_enqueue_request(ap_service_context_t *ctx, const ap_request_plan_t *plan) {
+    if (!ctx) {
+        return 0;
+    }
+    return append_ap_request_outbox(ctx->outbox, plan);
+}

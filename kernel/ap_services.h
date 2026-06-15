@@ -22,6 +22,7 @@
 typedef struct {
     volatile UINT32 *request_handled_count;
     volatile UINT32 *counter_value;
+    ap_request_outbox_t *outbox;
 } ap_service_context_t;
 
 typedef void (*ap_request_handler_t)(ap_service_context_t *ctx, ap_request_slot_t *slot);
@@ -45,5 +46,6 @@ ap_service_lookup_status_t ap_service_owner_context_index(UINT64 service_id, UIN
                                                           UINT32 *owner_context_index);
 ap_request_handler_t find_ap_request_handler(UINT64 service_id, UINT64 interface_id);
 UINT32 ap_dispatch_miss_result_code(UINT64 service_id, UINT64 interface_id);
+int ap_service_enqueue_request(ap_service_context_t *ctx, const ap_request_plan_t *plan);
 
 #endif

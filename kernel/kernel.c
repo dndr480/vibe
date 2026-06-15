@@ -2245,8 +2245,9 @@ static void ap_request_loop(ap_context_t *ctx) __attribute__((noreturn));
 static void ap_request_loop(ap_context_t *ctx) {
     ap_boot_info_t *boot = &ctx->boot;
     ap_service_context_t service_context = {
-        &ctx->request_handled_count,
-        &ctx->counter_value,
+        .request_handled_count = &ctx->request_handled_count,
+        .counter_value = &ctx->counter_value,
+        .outbox = 0,
     };
 
     boot->ap_state = AP_BOOT_STATE_ONLINE;

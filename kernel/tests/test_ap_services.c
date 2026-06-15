@@ -230,6 +230,128 @@ static void test_request_lifecycle(void) {
               "copy preserves wait metric");
 }
 
+static void test_request_outbox(void) {
+    const ap_request_plan_t first = {
+        .opcode = AP_REQUEST_OP_PING,
+        .service_id = AP_REQUEST_SERVICE_PING,
+        .interface_id = AP_REQUEST_INTERFACE_PING,
+        .sequence = 101,
+        .envelope = {
+            .parent_id_high = 0x1001ULL,
+            .parent_id_low = 0x1002ULL,
+            .reply_service_id = 0x1003ULL,
+            .reply_interface_id = 0x1004ULL,
+            .payload_addr = 0x1005ULL,
+            .payload_len = 128,
+            .flags = 0x10U,
+        },
+    };
+    const ap_request_plan_t second = {
+        .opcode = AP_REQUEST_OP_COUNTER,
+        .service_id = AP_REQUEST_SERVICE_COUNTER,
+        .interface_id = AP_REQUEST_INTERFACE_COUNTER_INCREMENT,
+        .sequence = 202,
+        .envelope = {
+            .parent_id_high = 0x2001ULL,
+            .parent_id_low = 0x2002ULL,
+            .reply_service_id = 0x2003ULL,
+            .reply_interface_id = 0x2004ULL,
+            .payload_addr = 0x2005ULL,
+            .payload_len = 256,
+            .flags = 0x20U,
+        },
+    };
+    ap_request_outbox_t outbox;
+
+    reset_ap_request_outbox(&outbox);
+    check_int(outbox.count == 0, "outbox reset clears count");
+    check_int(outbox.entries[0].opcode == 0, "outbox reset clears entries");
+
+    check_int(append_ap_request_outbox(&outbox, &first), "outbox append succeeds");
+    check_int(outbox.count == 1, "outbox append increments count");
+    check_int(outbox.entries[0].opcode == first.opcode, "outbox copies opcode");
+    check_int(outbox.entries[0].service_id == first.service_id, "outbox copies service");
+    check_int(outbox.entries[0].interface_id == first.interface_id,
+              "outbox copies interface");
+    check_int(outbox.entries[0].sequence == first.sequence, "outbox copies sequence");
+    check_int(outbox.entries[0].envelope.parent_id_high == first.envelope.parent_id_high,
+              "outbox copies parent id high");
+    check_int(outbox.entries[0].envelope.parent_id_low == first.envelope.parent_id_low,
+              "outbox copies parent id low");
+    check_int(outbox.entries[0].envelope.reply_service_id == first.envelope.reply_service_id,
+              "outbox copies reply service");
+    check_int(outbox.entries[0].envelope.reply_interface_id ==
+                  first.envelope.reply_interface_id,
+              "outbox copies reply interface");
+    check_int(outbox.entries[0].envelope.payload_addr == first.envelope.payload_addr,
+              "outbox copies payload address");
+    check_int(outbox.entries[0].envelope.payload_len == first.envelope.payload_len,
+              "outbox copies payload length");
+    check_int(outbox.entries[0].envelope.flags == first.envelope.flags,
+              "outbox copies flags");
+
+    for (UINT32 i = outbox.count; i < AP_REQUEST_OUTBOX_CAPACITY; i++) {
+        check_int(append_ap_request_outbox(&outbox, &second), "outbox fills capacity");
+    }
+    check_int(outbox.count == AP_REQUEST_OUTBOX_CAPACITY, "outbox reaches capacity");
+
+    ap_request_plan_t last = outbox.entries[AP_REQUEST_OUTBOX_CAPACITY - 1U];
+    check_int(!append_ap_request_outbox(&outbox, &first), "outbox full append fails");
+    check_int(outbox.count == AP_REQUEST_OUTBOX_CAPACITY,
+              "outbox full append preserves count");
+    check_int(outbox.entries[AP_REQUEST_OUTBOX_CAPACITY - 1U].sequence == last.sequence,
+              "outbox full append preserves last entry");
+    check_int(outbox.entries[AP_REQUEST_OUTBOX_CAPACITY - 1U].envelope.flags ==
+                  last.envelope.flags,
+              "outbox full append preserves last envelope");
+
+    check_int(!append_ap_request_outbox(0, &first), "null outbox append fails");
+    check_int(!append_ap_request_outbox(&outbox, 0), "null plan append fails");
+}
+
+static void test_service_enqueue_request(void) {
+    const ap_request_plan_t plan = {
+        .opcode = AP_REQUEST_OP_PING,
+        .service_id = AP_REQUEST_SERVICE_PING,
+        .interface_id = AP_REQUEST_INTERFACE_PING,
+        .sequence = 303,
+        .envelope = {
+            .parent_id_high = 0x3001ULL,
+            .parent_id_low = 0x3002ULL,
+            .reply_service_id = 0x3003ULL,
+            .reply_interface_id = 0x3004ULL,
+            .payload_addr = 0x3005ULL,
+            .payload_len = 512,
+            .flags = 0x30U,
+        },
+    };
+    volatile UINT32 handled_count = 0;
+    volatile UINT32 counter_value = 0;
+    ap_request_outbox_t outbox;
+    ap_service_context_t ctx = {
+        .request_handled_count = &handled_count,
+        .counter_value = &counter_value,
+        .outbox = &outbox,
+    };
+    ap_service_context_t null_outbox_ctx = {
+        .request_handled_count = &handled_count,
+        .counter_value = &counter_value,
+        .outbox = 0,
+    };
+
+    reset_ap_request_outbox(&outbox);
+    check_int(ap_service_enqueue_request(&ctx, &plan), "service enqueue records plan");
+    check_int(outbox.count == 1, "service enqueue increments outbox");
+    check_int(outbox.entries[0].sequence == plan.sequence, "service enqueue copies sequence");
+    check_int(outbox.entries[0].envelope.payload_len == plan.envelope.payload_len,
+              "service enqueue copies envelope");
+
+    check_int(!ap_service_enqueue_request(&null_outbox_ctx, &plan),
+              "service enqueue without outbox fails safely");
+    check_int(!ap_service_enqueue_request(0, &plan), "service enqueue null context fails");
+    check_int(!ap_service_enqueue_request(&ctx, 0), "service enqueue null plan fails");
+}
+
 static void test_lookup(void) {
     check_int(find_ap_request_handler(AP_REQUEST_SERVICE_PING,
                                       AP_REQUEST_INTERFACE_PING) != 0,
@@ -352,8 +474,14 @@ static void test_miss_result_code(void) {
 static void test_ping_handler(void) {
     volatile UINT32 handled_count = 0;
     volatile UINT32 counter_value = 41;
-    ap_service_context_t ctx = {&handled_count, &counter_value};
+    ap_request_outbox_t outbox;
+    ap_service_context_t ctx = {
+        .request_handled_count = &handled_count,
+        .counter_value = &counter_value,
+        .outbox = &outbox,
+    };
     ap_request_slot_t slot;
+    reset_ap_request_outbox(&outbox);
     reset_slot(&slot);
 
     ap_request_handler_t handler = find_ap_request_handler(AP_REQUEST_SERVICE_PING,
@@ -372,13 +500,20 @@ static void test_ping_handler(void) {
     check_int(slot.metrics.handled_count == 1, "PING records handled count");
     check_int(slot.reply.result_cs != 0xffffffffffffffffULL, "PING writes CS result");
     check_int(slot.reply.result_tr != 0xffffffffffffffffULL, "PING writes TR result");
+    check_int(outbox.count == 0, "PING does not write outbox");
 }
 
 static void test_counter_handler(void) {
     volatile UINT32 handled_count = 3;
     volatile UINT32 counter_value = 41;
-    ap_service_context_t ctx = {&handled_count, &counter_value};
+    ap_request_outbox_t outbox;
+    ap_service_context_t ctx = {
+        .request_handled_count = &handled_count,
+        .counter_value = &counter_value,
+        .outbox = &outbox,
+    };
     ap_request_slot_t slot;
+    reset_ap_request_outbox(&outbox);
     reset_slot(&slot);
 
     ap_request_handler_t handler =
@@ -398,6 +533,7 @@ static void test_counter_handler(void) {
     check_int(slot.metrics.handled_count == 4, "COUNTER records handled count");
     check_int(slot.reply.result_cs != 0xffffffffffffffffULL, "COUNTER writes CS result");
     check_int(slot.reply.result_tr != 0xffffffffffffffffULL, "COUNTER writes TR result");
+    check_int(outbox.count == 0, "COUNTER does not write outbox");
 }
 
 static void test_handlers_use_explicit_context(void) {
@@ -409,10 +545,26 @@ static void test_handlers_use_explicit_context(void) {
     volatile UINT32 counter_value_a = 100;
     volatile UINT32 handled_count_b = 20;
     volatile UINT32 counter_value_b = 200;
-    ap_service_context_t ping_ctx_a = {&ping_handled_count_a, &ping_counter_value_a};
-    ap_service_context_t ping_ctx_b = {&ping_handled_count_b, &ping_counter_value_b};
-    ap_service_context_t ctx_a = {&handled_count_a, &counter_value_a};
-    ap_service_context_t ctx_b = {&handled_count_b, &counter_value_b};
+    ap_service_context_t ping_ctx_a = {
+        .request_handled_count = &ping_handled_count_a,
+        .counter_value = &ping_counter_value_a,
+        .outbox = 0,
+    };
+    ap_service_context_t ping_ctx_b = {
+        .request_handled_count = &ping_handled_count_b,
+        .counter_value = &ping_counter_value_b,
+        .outbox = 0,
+    };
+    ap_service_context_t ctx_a = {
+        .request_handled_count = &handled_count_a,
+        .counter_value = &counter_value_a,
+        .outbox = 0,
+    };
+    ap_service_context_t ctx_b = {
+        .request_handled_count = &handled_count_b,
+        .counter_value = &counter_value_b,
+        .outbox = 0,
+    };
     ap_request_slot_t ping_slot_a1;
     ap_request_slot_t ping_slot_b;
     ap_request_slot_t ping_slot_a2;
@@ -469,6 +621,8 @@ static void test_handlers_use_explicit_context(void) {
 
 int main(void) {
     test_request_lifecycle();
+    test_request_outbox();
+    test_service_enqueue_request();
     test_lookup();
     test_registry_lookup();
     test_service_owner_lookup();

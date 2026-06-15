@@ -90,3 +90,25 @@ void copy_ap_request_slot(ap_request_slot_t *dst, const ap_request_slot_t *src) 
     dst->metrics.handled_count = src->metrics.handled_count;
     dst->metrics.wait_loops = src->metrics.wait_loops;
 }
+
+void reset_ap_request_outbox(ap_request_outbox_t *outbox) {
+    if (!outbox) {
+        return;
+    }
+
+    const ap_request_plan_t empty_plan = {0};
+    outbox->count = 0;
+    for (UINTN i = 0; i < AP_REQUEST_OUTBOX_CAPACITY; i++) {
+        outbox->entries[i] = empty_plan;
+    }
+}
+
+int append_ap_request_outbox(ap_request_outbox_t *outbox, const ap_request_plan_t *plan) {
+    if (!outbox || !plan || outbox->count >= AP_REQUEST_OUTBOX_CAPACITY) {
+        return 0;
+    }
+
+    outbox->entries[outbox->count] = *plan;
+    outbox->count++;
+    return 1;
+}
