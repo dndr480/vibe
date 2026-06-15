@@ -309,6 +309,93 @@ static void test_request_outbox(void) {
     check_int(!append_ap_request_outbox(&outbox, 0), "null plan append fails");
 }
 
+static void test_request_done_outbox_commit(void) {
+    const ap_request_plan_t child = {
+        .opcode = AP_REQUEST_OP_COUNTER,
+        .service_id = AP_REQUEST_SERVICE_COUNTER,
+        .interface_id = AP_REQUEST_INTERFACE_COUNTER_INCREMENT,
+        .sequence = 505,
+        .envelope = {
+            .parent_id_high = 0x5001ULL,
+            .parent_id_low = 0x5002ULL,
+            .reply_service_id = 0x5003ULL,
+            .reply_interface_id = 0x5004ULL,
+            .payload_addr = 0x5005ULL,
+            .payload_len = 2048,
+            .flags = 0x50U,
+        },
+    };
+    const ap_request_plan_t stale = {
+        .opcode = AP_REQUEST_OP_PING,
+        .service_id = AP_REQUEST_SERVICE_PING,
+        .interface_id = AP_REQUEST_INTERFACE_PING,
+        .sequence = 606,
+        .envelope = {
+            .parent_id_high = 0x6001ULL,
+            .parent_id_low = 0x6002ULL,
+            .reply_service_id = 0x6003ULL,
+            .reply_interface_id = 0x6004ULL,
+            .payload_addr = 0x6005ULL,
+            .payload_len = 4096,
+            .flags = 0x60U,
+        },
+    };
+    ap_request_slot_t slot;
+    ap_request_outbox_t scratch;
+    ap_request_outbox_t committed;
+
+    reset_ap_request_slot(&slot);
+    reset_ap_request_outbox(&scratch);
+    reset_ap_request_outbox(&committed);
+    check_int(append_ap_request_outbox(&scratch, &child),
+              "done commit test seeds scratch");
+    check_int(append_ap_request_outbox(&committed, &stale),
+              "done commit test seeds stale committed");
+    slot.state = AP_REQUEST_STATUS_RUNNING;
+
+    check_int(complete_ap_request_done_with_outbox(&slot, &committed, &scratch),
+              "running done commit succeeds");
+    check_int(slot.state == AP_REQUEST_STATUS_DONE, "done commit transitions state");
+    check_int(committed.count == 1, "done commit keeps committed count");
+    check_int(committed.entries[0].sequence == child.sequence,
+              "done commit copies child sequence");
+    check_int(committed.entries[0].envelope.parent_id_high ==
+                  child.envelope.parent_id_high,
+              "done commit copies parent id high");
+    check_int(committed.entries[0].envelope.payload_len == child.envelope.payload_len,
+              "done commit copies payload length");
+    check_int(committed.entries[0].envelope.flags == child.envelope.flags,
+              "done commit copies flags");
+
+    reset_ap_request_outbox(&scratch);
+    reset_ap_request_outbox(&committed);
+    check_int(append_ap_request_outbox(&scratch, &child),
+              "late done test seeds scratch");
+    check_int(append_ap_request_outbox(&committed, &stale),
+              "late done test seeds stale committed");
+    slot.state = AP_REQUEST_STATUS_TIMEOUT;
+    check_int(!complete_ap_request_done_with_outbox(&slot, &committed, &scratch),
+              "timeout late done commit fails");
+    check_int(slot.state == AP_REQUEST_STATUS_TIMEOUT,
+              "timeout late done preserves state");
+    check_int(committed.count == 0, "timeout late done clears committed count");
+    check_int(committed.entries[0].opcode == 0,
+              "timeout late done clears stale committed entry");
+
+    reset_ap_request_outbox(&committed);
+    check_int(append_ap_request_outbox(&committed, &stale),
+              "null slot test seeds stale committed");
+    check_int(!complete_ap_request_done_with_outbox(0, &committed, &scratch),
+              "null slot done commit fails safely");
+    check_int(committed.count == 0, "null slot done commit clears committed");
+
+    slot.state = AP_REQUEST_STATUS_RUNNING;
+    check_int(complete_ap_request_done_with_outbox(&slot, 0, &scratch),
+              "null committed done transition still succeeds");
+    check_int(slot.state == AP_REQUEST_STATUS_DONE,
+              "null committed done transition sets state");
+}
+
 static void test_service_enqueue_request(void) {
     const ap_request_plan_t plan = {
         .opcode = AP_REQUEST_OP_PING,
@@ -677,6 +764,7 @@ static void test_handlers_use_explicit_context(void) {
 int main(void) {
     test_request_lifecycle();
     test_request_outbox();
+    test_request_done_outbox_commit();
     test_service_enqueue_request();
     test_service_context_prepare();
     test_lookup();

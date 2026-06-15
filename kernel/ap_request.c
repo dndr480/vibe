@@ -91,6 +91,66 @@ void copy_ap_request_slot(ap_request_slot_t *dst, const ap_request_slot_t *src) 
     dst->metrics.wait_loops = src->metrics.wait_loops;
 }
 
+static int cmpxchg_u32(volatile UINT32 *ptr, UINT32 expected, UINT32 desired) {
+    UINT8 success;
+    __asm__ __volatile__(
+        "lock cmpxchgl %3, %1\n"
+        "sete %0"
+        : "=q"(success), "+m"(*ptr), "+a"(expected)
+        : "r"(desired)
+        : "cc", "memory");
+    return success ? 1 : 0;
+}
+
+static void copy_ap_request_plan(ap_request_plan_t *dst, const ap_request_plan_t *src) {
+    dst->opcode = src->opcode;
+    dst->service_id = src->service_id;
+    dst->interface_id = src->interface_id;
+    dst->sequence = src->sequence;
+    dst->envelope.parent_id_high = src->envelope.parent_id_high;
+    dst->envelope.parent_id_low = src->envelope.parent_id_low;
+    dst->envelope.reply_service_id = src->envelope.reply_service_id;
+    dst->envelope.reply_interface_id = src->envelope.reply_interface_id;
+    dst->envelope.payload_addr = src->envelope.payload_addr;
+    dst->envelope.payload_len = src->envelope.payload_len;
+    dst->envelope.flags = src->envelope.flags;
+}
+
+static void copy_ap_request_outbox(ap_request_outbox_t *dst,
+                                   const ap_request_outbox_t *src) {
+    if (!dst) {
+        return;
+    }
+    if (!src) {
+        reset_ap_request_outbox(dst);
+        return;
+    }
+
+    UINT32 count = src->count;
+    if (count > AP_REQUEST_OUTBOX_CAPACITY) {
+        count = AP_REQUEST_OUTBOX_CAPACITY;
+    }
+    dst->count = count;
+    for (UINTN i = 0; i < AP_REQUEST_OUTBOX_CAPACITY; i++) {
+        if (i < count) {
+            copy_ap_request_plan(&dst->entries[i], &src->entries[i]);
+        } else {
+            ap_request_plan_t *entry = &dst->entries[i];
+            entry->opcode = 0;
+            entry->service_id = 0;
+            entry->interface_id = 0;
+            entry->sequence = 0;
+            entry->envelope.parent_id_high = 0;
+            entry->envelope.parent_id_low = 0;
+            entry->envelope.reply_service_id = 0;
+            entry->envelope.reply_interface_id = 0;
+            entry->envelope.payload_addr = 0;
+            entry->envelope.payload_len = 0;
+            entry->envelope.flags = 0;
+        }
+    }
+}
+
 void reset_ap_request_outbox(ap_request_outbox_t *outbox) {
     if (!outbox) {
         return;
@@ -118,7 +178,26 @@ int append_ap_request_outbox(ap_request_outbox_t *outbox, const ap_request_plan_
         return 0;
     }
 
-    outbox->entries[outbox->count] = *plan;
+    copy_ap_request_plan(&outbox->entries[outbox->count], plan);
     outbox->count++;
+    return 1;
+}
+
+int complete_ap_request_done_with_outbox(ap_request_slot_t *slot,
+                                         ap_request_outbox_t *committed,
+                                         const ap_request_outbox_t *scratch) {
+    if (!slot) {
+        reset_ap_request_outbox(committed);
+        return 0;
+    }
+
+    copy_ap_request_outbox(committed, scratch);
+    __asm__ __volatile__("mfence" : : : "memory");
+    if (!cmpxchg_u32(&slot->state, AP_REQUEST_STATUS_RUNNING, AP_REQUEST_STATUS_DONE)) {
+        reset_ap_request_outbox(committed);
+        __asm__ __volatile__("mfence" : : : "memory");
+        return 0;
+    }
+    __asm__ __volatile__("mfence" : : : "memory");
     return 1;
 }

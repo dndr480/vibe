@@ -100,5 +100,8 @@ void prepare_ap_request_slot_from_plan(ap_request_slot_t *slot, UINT32 target_cp
 void copy_ap_request_slot(ap_request_slot_t *dst, const ap_request_slot_t *src);
 void reset_ap_request_outbox(ap_request_outbox_t *outbox);
 int append_ap_request_outbox(ap_request_outbox_t *outbox, const ap_request_plan_t *plan);
+int complete_ap_request_done_with_outbox(ap_request_slot_t *slot,
+                                         ap_request_outbox_t *committed,
+                                         const ap_request_outbox_t *scratch);
 
 #endif

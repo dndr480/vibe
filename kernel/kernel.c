@@ -687,6 +687,7 @@ static ap_scheduler_t ap_scheduler;
 static ap_request_route_t ap_request_route;
 static ap_context_t ap_contexts[MAX_AP_CONTEXTS];
 static ap_request_outbox_t ap_service_outboxes[MAX_AP_CONTEXTS];
+static ap_request_outbox_t ap_committed_outboxes[MAX_AP_CONTEXTS][AP_REQUEST_SLOT_COUNT];
 static ap_context_t *ap_request_target_context = &ap_contexts[0];
 static ap_interrupt_observe_t *ap_request_interrupts __attribute__((used)) = &ap_contexts[0].interrupts;
 static volatile UINT64 system_lapic_base;
@@ -709,6 +710,19 @@ static ap_request_outbox_t *ap_service_outbox_for_context(ap_context_t *ctx) {
     for (UINT32 i = 0; i < MAX_AP_CONTEXTS; i++) {
         if (ctx == &ap_contexts[i]) {
             return &ap_service_outboxes[i];
+        }
+    }
+    return 0;
+}
+
+static ap_request_outbox_t *ap_committed_outbox_for_slot(ap_context_t *ctx,
+                                                         UINTN slot_index) {
+    if (slot_index >= AP_REQUEST_SLOT_COUNT) {
+        return 0;
+    }
+    for (UINT32 i = 0; i < MAX_AP_CONTEXTS; i++) {
+        if (ctx == &ap_contexts[i]) {
+            return &ap_committed_outboxes[i][slot_index];
         }
     }
     return 0;
@@ -2082,6 +2096,7 @@ static UINTN ap_inbox_slot_limit(UINTN count) {
 
 static void reset_ap_inbox_slot(ap_context_t *ctx, UINTN slot_index) {
     reset_ap_request_slot(ap_inbox_slot(ctx, slot_index));
+    reset_ap_request_outbox(ap_committed_outbox_for_slot(ctx, slot_index));
 }
 
 static void reset_ap_request_history(ap_context_t *ctx) {
@@ -2291,10 +2306,16 @@ static void ap_request_loop(ap_context_t *ctx) {
                 handler(&service_context, slot);
                 boot->ap_state = AP_BOOT_STATE_ONLINE;
                 boot->entry_state = AP_ENTRY_STATE_LOOP;
-                ap_queue_note_slot_terminal(ctx, i, AP_REQUEST_STATUS_DONE, AP_QUEUE_STOP_NONE);
-                ctx->current_request_slot = AP_REQUEST_NO_SLOT;
-                complete_ap_request(slot, AP_REQUEST_STATUS_DONE);
-                ap_notify_bsp_request_complete(ctx);
+                if (complete_ap_request_done_with_outbox(slot,
+                                                          ap_committed_outbox_for_slot(ctx, i),
+                                                          service_context.outbox)) {
+                    ap_queue_note_slot_terminal(ctx, i, AP_REQUEST_STATUS_DONE,
+                                                AP_QUEUE_STOP_NONE);
+                    ctx->current_request_slot = AP_REQUEST_NO_SLOT;
+                    ap_notify_bsp_request_complete(ctx);
+                } else {
+                    ctx->current_request_slot = AP_REQUEST_NO_SLOT;
+                }
             } else {
                 slot->reply.result_code = ap_dispatch_miss_result_code(slot->request.service_id,
                                                                        slot->request.interface_id);
@@ -2432,6 +2453,29 @@ static int ap_request_stream_has_finished_slot(ap_request_slot_t *slots, UINT8 *
     return 0;
 }
 
+static UINT32 ap_stream_finished_slot_order(ap_request_slot_t *slot, UINTN slot_index) {
+    if (slot->state == AP_REQUEST_STATUS_DONE && slot->metrics.handled_count != 0) {
+        return slot->metrics.handled_count;
+    }
+    return 0x80000000U + (UINT32)slot_index;
+}
+
+static int ap_stream_has_earlier_finished_slot(ap_request_slot_t *slots, UINT8 *active,
+                                               UINTN count, UINTN slot_index) {
+    ap_request_slot_t *slot = &slots[slot_index];
+    UINT32 slot_order = ap_stream_finished_slot_order(slot, slot_index);
+
+    for (UINTN i = 0; i < count; i++) {
+        if (i == slot_index || !active[i] || !ap_request_state_finished(slots[i].state)) {
+            continue;
+        }
+        if (ap_stream_finished_slot_order(&slots[i], i) < slot_order) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
 static int ap_request_stream_should_stop(ap_context_t *ctx) {
     ap_boot_info_t *boot = &ctx->boot;
     return boot->ap_state == AP_BOOT_STATE_FAULTED ||
@@ -2529,6 +2573,10 @@ static int run_ap_request_stream(ap_context_t *ctx, const ap_request_plan_t *pla
 
         for (UINTN slot_index = 0; slot_index < count; slot_index++) {
             if (!active[slot_index]) {
+                continue;
+            }
+            if (ap_request_state_finished(slots[slot_index].state) &&
+                ap_stream_has_earlier_finished_slot(slots, active, count, slot_index)) {
                 continue;
             }
             int done = finish_ap_stream_slot(ctx, slots, active, slot_index, wait_loops,
