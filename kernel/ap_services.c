@@ -113,6 +113,20 @@ UINT32 ap_dispatch_miss_result_code(UINT64 service_id, UINT64 interface_id) {
     return (UINT32)interface_id;
 }
 
+void prepare_ap_service_context(ap_service_context_t *ctx,
+                                volatile UINT32 *request_handled_count,
+                                volatile UINT32 *counter_value,
+                                ap_request_outbox_t *outbox) {
+    if (!ctx) {
+        return;
+    }
+
+    ctx->request_handled_count = request_handled_count;
+    ctx->counter_value = counter_value;
+    ctx->outbox = outbox;
+    reset_ap_request_outbox(outbox);
+}
+
 int ap_service_enqueue_request(ap_service_context_t *ctx, const ap_request_plan_t *plan) {
     if (!ctx) {
         return 0;

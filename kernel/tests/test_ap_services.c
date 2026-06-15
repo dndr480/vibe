@@ -352,6 +352,61 @@ static void test_service_enqueue_request(void) {
     check_int(!ap_service_enqueue_request(&ctx, 0), "service enqueue null plan fails");
 }
 
+static void test_service_context_prepare(void) {
+    const ap_request_plan_t plan = {
+        .opcode = AP_REQUEST_OP_COUNTER,
+        .service_id = AP_REQUEST_SERVICE_COUNTER,
+        .interface_id = AP_REQUEST_INTERFACE_COUNTER_INCREMENT,
+        .sequence = 404,
+        .envelope = {
+            .parent_id_high = 0x4001ULL,
+            .parent_id_low = 0x4002ULL,
+            .reply_service_id = 0x4003ULL,
+            .reply_interface_id = 0x4004ULL,
+            .payload_addr = 0x4005ULL,
+            .payload_len = 1024,
+            .flags = 0x40U,
+        },
+    };
+    volatile UINT32 handled_count = 7;
+    volatile UINT32 counter_value = 11;
+    ap_request_outbox_t outbox;
+    ap_service_context_t ctx = {
+        .request_handled_count = 0,
+        .counter_value = 0,
+        .outbox = 0,
+    };
+
+    reset_ap_request_outbox(&outbox);
+    check_int(append_ap_request_outbox(&outbox, &plan), "prepare test seeds stale outbox");
+    check_int(outbox.count == 1, "prepare test starts with stale entry");
+
+    prepare_ap_service_context(&ctx, &handled_count, &counter_value, &outbox);
+    check_int(ctx.request_handled_count == &handled_count,
+              "service context prepare wires handled count");
+    check_int(ctx.counter_value == &counter_value, "service context prepare wires counter");
+    check_int(ctx.outbox == &outbox, "service context prepare wires outbox");
+    check_int(outbox.count == 0, "service context prepare resets stale outbox");
+    check_int(outbox.entries[0].opcode == 0, "service context prepare clears outbox entries");
+
+    check_int(ap_service_enqueue_request(&ctx, &plan),
+              "prepared service context accepts enqueue");
+    check_int(outbox.count == 1, "prepared service context records enqueue");
+    check_int(outbox.entries[0].envelope.payload_len == plan.envelope.payload_len,
+              "prepared service context preserves enqueue envelope");
+
+    prepare_ap_service_context(&ctx, &handled_count, &counter_value, &outbox);
+    check_int(outbox.count == 0, "next request prepare clears previous enqueue");
+    check_int(ctx.outbox == &outbox, "next request prepare keeps outbox wired");
+
+    prepare_ap_service_context(&ctx, &handled_count, &counter_value, 0);
+    check_int(ctx.outbox == 0, "service context prepare accepts null outbox");
+    check_int(!ap_service_enqueue_request(&ctx, &plan),
+              "service context with null outbox cannot enqueue");
+
+    prepare_ap_service_context(0, &handled_count, &counter_value, &outbox);
+}
+
 static void test_lookup(void) {
     check_int(find_ap_request_handler(AP_REQUEST_SERVICE_PING,
                                       AP_REQUEST_INTERFACE_PING) != 0,
@@ -623,6 +678,7 @@ int main(void) {
     test_request_lifecycle();
     test_request_outbox();
     test_service_enqueue_request();
+    test_service_context_prepare();
     test_lookup();
     test_registry_lookup();
     test_service_owner_lookup();

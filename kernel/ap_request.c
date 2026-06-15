@@ -96,10 +96,20 @@ void reset_ap_request_outbox(ap_request_outbox_t *outbox) {
         return;
     }
 
-    const ap_request_plan_t empty_plan = {0};
     outbox->count = 0;
     for (UINTN i = 0; i < AP_REQUEST_OUTBOX_CAPACITY; i++) {
-        outbox->entries[i] = empty_plan;
+        ap_request_plan_t *entry = &outbox->entries[i];
+        entry->opcode = 0;
+        entry->service_id = 0;
+        entry->interface_id = 0;
+        entry->sequence = 0;
+        entry->envelope.parent_id_high = 0;
+        entry->envelope.parent_id_low = 0;
+        entry->envelope.reply_service_id = 0;
+        entry->envelope.reply_interface_id = 0;
+        entry->envelope.payload_addr = 0;
+        entry->envelope.payload_len = 0;
+        entry->envelope.flags = 0;
     }
 }
 

@@ -686,6 +686,7 @@ static ap_broadcast_ping_summary_t ap_broadcast_ping_summary;
 static ap_scheduler_t ap_scheduler;
 static ap_request_route_t ap_request_route;
 static ap_context_t ap_contexts[MAX_AP_CONTEXTS];
+static ap_request_outbox_t ap_service_outboxes[MAX_AP_CONTEXTS];
 static ap_context_t *ap_request_target_context = &ap_contexts[0];
 static ap_interrupt_observe_t *ap_request_interrupts __attribute__((used)) = &ap_contexts[0].interrupts;
 static volatile UINT64 system_lapic_base;
@@ -699,6 +700,15 @@ static UINT32 ap_context_index(ap_context_t *ctx) {
     for (UINT32 i = 0; i < MAX_AP_CONTEXTS; i++) {
         if (ctx == &ap_contexts[i]) {
             return i;
+        }
+    }
+    return 0;
+}
+
+static ap_request_outbox_t *ap_service_outbox_for_context(ap_context_t *ctx) {
+    for (UINT32 i = 0; i < MAX_AP_CONTEXTS; i++) {
+        if (ctx == &ap_contexts[i]) {
+            return &ap_service_outboxes[i];
         }
     }
     return 0;
@@ -2244,11 +2254,7 @@ static UINT32 bsp_wait_for_ap_request_event(void) {
 static void ap_request_loop(ap_context_t *ctx) __attribute__((noreturn));
 static void ap_request_loop(ap_context_t *ctx) {
     ap_boot_info_t *boot = &ctx->boot;
-    ap_service_context_t service_context = {
-        .request_handled_count = &ctx->request_handled_count,
-        .counter_value = &ctx->counter_value,
-        .outbox = 0,
-    };
+    ap_service_context_t service_context;
 
     boot->ap_state = AP_BOOT_STATE_ONLINE;
     boot->entry_state = AP_ENTRY_STATE_LOOP;
@@ -2276,6 +2282,9 @@ static void ap_request_loop(ap_context_t *ctx) {
             boot->entry_state = AP_ENTRY_STATE_REQUEST;
             __asm__ __volatile__("mfence" : : : "memory");
 
+            prepare_ap_service_context(&service_context, &ctx->request_handled_count,
+                                       &ctx->counter_value,
+                                       ap_service_outbox_for_context(ctx));
             ap_request_handler_t handler = find_ap_request_handler(slot->request.service_id,
                                                                    slot->request.interface_id);
             if (handler) {
@@ -2744,6 +2753,7 @@ static void init_ap_context(ap_context_t *ctx, ap_boot_info_t *trampoline_boot,
 static void init_ap_contexts(ap_boot_info_t *trampoline_boot, UINT32 completion_target_apic_id) {
     for (UINTN i = 0; i < MAX_AP_CONTEXTS; i++) {
         init_ap_context(&ap_contexts[i], trampoline_boot, completion_target_apic_id);
+        reset_ap_request_outbox(&ap_service_outboxes[i]);
     }
 }
 
